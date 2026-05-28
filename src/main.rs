@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod input;
+mod mascot;
 mod theme;
 mod ui;
 mod fs;

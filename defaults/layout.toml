@@ -1,0 +1,61 @@
+# Local project layout config for DIRT
+# Used directly by the app (no system config required)
+
+[sidebar]
+bookmarks = [{ name = "home", path = "~" }]
+recent_dirs_limit = 10
+drives_limit = 10
+
+[ui]
+top_bar_height = 3
+
+[ui.panels]
+sidebar = true
+columns = true
+preview = true
+search_bar = true
+status_bar = true
+keymap_bar = true
+
+[ui.panel_ratios]
+sidebar = 1
+dir = 4
+preview = 1
+
+[navigation]
+start_dir = "~/"
+show_hidden = false
+sort = "name"
+
+[miller]
+column_count = 4
+active_column = 3
+column_ratios = [1, 2, 3, 2]
+
+[features]
+enabled = ["preview", "git_status"]
+
+[search]
+ignored_dirs = [".git", "node_modules"]
+max_depth = 6
+
+[[profiles]]
+name = "default"
+theme = "dark"
+start_dir = "~/"
+show_hidden = false
+features = ["preview", "git_status"]
+
+[[profiles]]
+name = "dev"
+theme = "dark"
+start_dir = "~/"
+show_hidden = true
+features = ["preview", "git_status", "thumbnails"]
+
+[[profiles]]
+name = "clean"
+theme = "dark"
+start_dir = "~/"
+show_hidden = false
+features = ["preview"]
