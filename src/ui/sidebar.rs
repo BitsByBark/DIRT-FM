@@ -1,0 +1,1 @@
+// Sidebar rendering module boundary.
