@@ -5,12 +5,14 @@ Terminal file explorer in Rust with a Miller-columns workflow, profile-based con
 ## Status
 
 Active prototype with:
-- three-pane layout (sidebar, Miller columns, details)
+- three-pane main layout (sidebar, Miller columns, details)
+- two bars (top + bottom keymap/status row)
 - profile switching
 - local/global search
 - file operations (new file/dir, copy, cut, paste, trash with confirmation)
 - selection mode + range selection
-- external theme loading
+- bookmark mode with numbered slots
+- theme-driven UI from TOML
 
 ## Stack
 
@@ -35,7 +37,7 @@ cargo run
 ### Linux
 
 ```bash
-git clone <your-repo-url> dirt
+git clone https://github.com/BitsByBark/DIRT-FM.git dirt
 cd dirt
 cargo build --release
 ```
@@ -53,7 +55,7 @@ cp target/release/DIRT ~/.local/bin/dirt
 ### macOS
 
 ```bash
-git clone <your-repo-url> dirt
+git clone https://github.com/BitsByBark/DIRT-FM.git dirt
 cd dirt
 cargo build --release
 ```
@@ -71,7 +73,7 @@ cp target/release/DIRT ~/.local/bin/dirt
 ### Windows (PowerShell)
 
 ```powershell
-git clone <your-repo-url> dirt
+git clone https://github.com/BitsByBark/DIRT-FM.git dirt
 cd dirt
 cargo build --release
 ```
@@ -86,6 +88,8 @@ Optional install:
 ### First-time setup (inside DIRT)
 
 - Run `/config init` in the search bar to create `dirt.toml`
+- Run `/config layout init` in the search bar to create `layout.toml`
+- Run `/config theme init` in the search bar to create `theme.toml`
 - Run `/keymap init` in the search bar to create `keymap.toml`
 
 ## Cross-platform build notes
@@ -99,29 +103,35 @@ Optional install:
 
 ## Config
 
-Primary config path:
+Project defaults used by the app:
 
-`~/.config/dirt/dirt.toml`
+`defaults/layout.toml`
+
+Theme defaults/fallback:
+
+`defaults/theme.toml`
+
+User-init config paths (created by init commands):
+
+`~/.config/dirt/dirt.toml`  
+`~/.config/dirt/layout.toml`  
+`~/.config/dirt/theme.toml`
 
 Keymap config path:
 
 `~/.config/dirt/keymap.toml`
 
 Current behavior:
-- if config exists, DIRT reads it
-- if config is missing, DIRT uses in-memory defaults
-- `/config init` in the search bar writes a commented starter config
+- layout/theme defaults are sourced from `defaults/layout.toml` and `defaults/theme.toml`
+- `/config init` writes `dirt.toml`
+- `/config layout init` writes `layout.toml`
+- `/config theme init` writes `theme.toml`
 - `keymap.toml` is loaded on startup when present, otherwise hardcoded defaults are used
 - `/keymap init` in the search bar writes a default keymap file
 
 ## Themes
 
-Theme directory:
-
-`~/.config/dirt/themes/`
-
-Profiles select theme by name (`theme = "dark"` etc).  
-Theme loader supports `$var` references from `[vars]` blocks at load time.
+Theme data is read from TOML and supports `$var` references from `[vars]` blocks.
 
 ## Default keybinds
 
@@ -153,6 +163,11 @@ Theme loader supports `$var` references from `[vars]` blocks at load time.
 - `Ctrl+V`: paste
 - `Ctrl+D`: delete to trash (confirm dialog)
 
+### Bookmarks
+- `Ctrl+B`: enter bookmark mode
+- In bookmark mode: `1..9` assign slot, `Esc` exit bookmark mode
+- `Ctrl+1..9` or `1..9`: open bookmark slot
+
 ## Keymap Bar
 
 - Normal mode: `↑↓←→ navigate | Ctrl+S select mode | q quit`
@@ -164,6 +179,7 @@ Theme loader supports `$var` references from `[vars]` blocks at load time.
 src/
   main.rs
   app.rs
+  mascot.rs
   config.rs
   theme.rs
   input.rs

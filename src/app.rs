@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     collections::HashSet,
+    env,
     fs,
     io,
     path::{Path, PathBuf},
@@ -17,10 +18,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use ratatui::layout::Alignment;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use crate::theme::{ColumnTheme, Theme};
+use crate::mascot::render_empty_dir_mascot;
 
 pub fn run_app() -> Result<()> {
     color_eyre::install()?;
@@ -66,6 +69,8 @@ struct AppConfig {
     #[serde(default = "default_search")]
     search: SearchSettings,
     #[serde(default)]
+    miller: MillerConfig,
+    #[serde(default)]
     profiles: Vec<Profile>,
     #[serde(skip)]
     themes: ThemeRegistry,
@@ -75,6 +80,10 @@ struct AppConfig {
 struct SidebarConfig {
     #[serde(default)]
     bookmarks: Vec<Bookmark>,
+    #[serde(default = "default_recent_dirs_limit")]
+    recent_dirs_limit: usize,
+    #[serde(default = "default_drives_limit")]
+    drives_limit: usize,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -153,55 +162,23 @@ struct SearchSettings {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct UiColors {
-    #[serde(default = "default_color_bg")]
-    background: String,
-    #[serde(default = "default_color_fg")]
-    foreground: String,
-    #[serde(default = "default_color_accent")]
-    accent: String,
-    #[serde(default = "default_color_status")]
-    status_bar: String,
-    #[serde(default = "default_color_keymap")]
-    keymap_bar: String,
-    #[serde(default = "default_color_search")]
-    search_bar: String,
-    #[serde(default = "default_color_selection_bg")]
-    selection_bg: String,
-    #[serde(default = "default_color_selection_fg")]
-    selection_fg: String,
-    #[serde(default = "default_color_selection_entry")]
-    selection_entry: String,
-    #[serde(default = "default_color_inactive_border")]
-    inactive_border: String,
-    #[serde(default = "default_color_dimmed_border")]
-    dimmed_border: String,
-    #[serde(default = "default_color_sidebar_header")]
-    sidebar_header: String,
-    #[serde(default = "default_color_sidebar_drive")]
-    sidebar_drive: String,
-    #[serde(default = "default_color_sidebar_recent")]
-    sidebar_recent: String,
-    #[serde(default = "default_color_column_header")]
-    column_header: String,
-    #[serde(default = "default_color_column_dir")]
-    column_dir: String,
-    #[serde(default = "default_color_column_file")]
-    column_file: String,
-    #[serde(default = "default_color_column_symlink")]
-    column_symlink: String,
-    #[serde(default = "default_color_column_exec")]
-    column_exec: String,
-    #[serde(default = "default_color_status_meta")]
-    status_meta: String,
-    #[serde(default = "default_color_status_profile")]
-    status_profile: String,
-    #[serde(default = "default_color_status_selection_mode")]
-    status_selection_mode: String,
-    #[serde(default = "default_color_keymap_label")]
-    keymap_label: String,
-    #[serde(default = "default_color_keymap_key")]
-    keymap_key: String,
+struct MillerConfig {
+    #[serde(default = "default_max_columns")]
+    column_count: usize,
+    #[serde(default = "default_active_column")]
+    active_column: usize,
+    #[serde(default = "default_column_ratios")]
+    column_ratios: Vec<u16>,
+}
+
+impl Default for MillerConfig {
+    fn default() -> Self {
+        Self {
+            column_count: default_max_columns(),
+            active_column: default_active_column(),
+            column_ratios: default_column_ratios(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -218,6 +195,8 @@ struct Hooks {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Bookmark {
+    #[serde(default)]
+    slot: Option<u8>,
     name: String,
     path: String,
 }
@@ -230,29 +209,26 @@ struct EffectiveSettings {
     start_dir: PathBuf,
     top_bar_height: u16,
     features: Vec<String>,
-    ui_colors: UiColors,
+    theme_colors: Theme,
     panel_sizes: PanelSizes,
     max_columns: usize,
+    active_column: usize,
+    column_ratios: Vec<u16>,
     search: SearchSettings,
     panels: Panels,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ThemeRegistry {
-    by_name: HashMap<String, UiColors>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ThemeFile {
-    #[serde(default = "default_ui_colors")]
-    ui_colors: UiColors,
+    by_name: HashMap<String, Theme>,
 }
 
 impl AppConfig {
     fn load() -> Result<Self> {
-        ensure_default_themes()?;
-        let cfg = if config_path().exists() {
-            toml::from_str::<AppConfig>(&fs::read_to_string(config_path())?)?
+        ensure_local_defaults_files()?;
+        let cfg = if let Ok(raw) = fs::read_to_string("defaults/layout.toml") {
+            toml::from_str::<AppConfig>(&raw)
+                .unwrap_or_else(|_| toml::from_str::<AppConfig>(default_config_contents()).unwrap())
         } else {
             toml::from_str::<AppConfig>(default_config_contents())?
         };
@@ -283,12 +259,23 @@ impl AppConfig {
         let features = profile
             .and_then(|p| p.features.clone())
             .unwrap_or_else(|| self.features.enabled.clone());
-        let ui_colors = self
+        let theme_colors = self
             .themes
             .by_name
             .get(&theme)
             .cloned()
-            .unwrap_or_else(default_ui_colors);
+            .unwrap_or_else(load_default_theme_fallback);
+        let max_columns = self.miller.column_count.max(2);
+        let active_column = self.miller.active_column.min(max_columns.saturating_sub(2));
+        let mut column_ratios = self.miller.column_ratios.clone();
+        if column_ratios.is_empty() {
+            column_ratios = vec![1; max_columns];
+        }
+        if column_ratios.len() < max_columns {
+            column_ratios.resize(max_columns, 1);
+        } else if column_ratios.len() > max_columns {
+            column_ratios.truncate(max_columns);
+        }
         EffectiveSettings {
             theme,
             show_hidden,
@@ -296,9 +283,11 @@ impl AppConfig {
             start_dir: normalize_start_dir(&start_dir),
             top_bar_height: self.ui.top_bar_height.max(1),
             features,
-            ui_colors,
+            theme_colors,
             panel_sizes: self.ui.panel_ratios.clone(),
-            max_columns: self.navigation.max_columns.max(1),
+            max_columns,
+            active_column,
+            column_ratios,
             search: self.search.clone(),
             panels: self.ui.panels.clone(),
         }
@@ -332,6 +321,9 @@ struct App {
     simple_column_path: Option<PathBuf>,
     dialog: Option<DialogState>,
     keymap: KeymapConfig,
+    awaiting_bookmark_slot: bool,
+    user_name: String,
+    device_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +349,12 @@ struct ClipboardItem {
 #[derive(Debug, Clone)]
 enum DialogState {
     ConfirmDelete { paths: Vec<PathBuf>, yes_selected: bool },
+    ConfirmBookmarkOverwrite {
+        slot: char,
+        existing_path: String,
+        new_path: String,
+        yes_selected: bool,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -420,6 +418,7 @@ impl App {
         let keymap = load_keymap_config();
         let recents = load_recents()?;
         let drives = discover_drives();
+        let (user_name, device_name) = user_device_names();
         let current_dir = effective.start_dir.clone();
         let columns = build_columns_from_path(&current_dir, &effective);
         Ok(Self {
@@ -449,6 +448,9 @@ impl App {
             simple_column_path: None,
             dialog: None,
             keymap,
+            awaiting_bookmark_slot: false,
+            user_name,
+            device_name,
         })
     }
 
@@ -463,6 +465,17 @@ impl App {
         }
         if self.search_mode != SearchMode::None {
             self.handle_search_input(key);
+            return;
+        }
+        if key.code == KeyCode::Esc && self.awaiting_bookmark_slot {
+            self.awaiting_bookmark_slot = false;
+            self.status_message = "bookmark mode off".to_string();
+            return;
+        }
+        if self.awaiting_bookmark_slot
+            && let Some(slot) = bookmark_slot_from_key(key)
+        {
+            self.set_bookmark_slot(slot);
             return;
         }
         if self.selection_mode {
@@ -505,14 +518,26 @@ impl App {
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => self.cut_selected(),
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => self.paste_clipboard(),
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => self.request_delete_to_trash(),
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.awaiting_bookmark_slot = true;
+                self.status_message = "bookmark set mode: press 1-9".to_string();
+            }
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL) && ('1'..='9').contains(&c) =>
+            {
+                self.open_bookmark_slot(c);
+            }
+            KeyCode::Char(c) if key.modifiers.is_empty() && ('1'..='9').contains(&c) => {
+                self.open_bookmark_slot(c);
+            }
             _ => {}
         }
     }
 
     fn draw(&self, frame: &mut Frame) {
         let base_style = Style::default()
-            .bg(parse_color(&self.effective.ui_colors.background))
-            .fg(parse_color(&self.effective.ui_colors.foreground));
+            .bg(parse_color(&self.effective.theme_colors.vars.primary_bg))
+            .fg(parse_color(&self.effective.theme_colors.vars.primary_fg));
         frame.render_widget(Paragraph::new("").style(base_style), frame.area());
 
         let mut rows = Vec::new();
@@ -520,11 +545,8 @@ impl App {
             rows.push(Constraint::Length(self.effective.top_bar_height));
         }
         rows.push(Constraint::Min(1));
-        if self.effective.panels.status_bar {
-            rows.push(Constraint::Length(1));
-        }
-        if self.effective.panels.keymap_bar {
-            rows.push(Constraint::Length(1));
+        if self.effective.panels.status_bar || self.effective.panels.keymap_bar {
+            rows.push(Constraint::Length(3));
         }
 
         let chunks = Layout::default()
@@ -565,12 +587,12 @@ impl App {
             frame.render_widget(p, main_area);
         }
 
-        if self.effective.panels.status_bar {
-            self.draw_status(frame, chunks[row_index]);
-            row_index += 1;
-        }
-        if self.effective.panels.keymap_bar {
-            self.draw_keymap_bar(frame, chunks[row_index]);
+        if self.effective.panels.status_bar || self.effective.panels.keymap_bar {
+            if self.effective.panels.keymap_bar {
+                self.draw_keymap_bar(frame, chunks[row_index]);
+            } else {
+                self.draw_status(frame, chunks[row_index]);
+            }
         }
         if self.dialog.is_some() {
             self.draw_dialog(frame);
@@ -598,7 +620,31 @@ impl App {
             .collect()
     }
 
+    fn column_theme_for(&self, idx: usize) -> &ColumnTheme {
+        match idx {
+            0 => &self.effective.theme_colors.col_1,
+            1 => &self.effective.theme_colors.col_2,
+            2 => &self.effective.theme_colors.col_3,
+            _ => &self.effective.theme_colors.col_4,
+        }
+    }
+
     fn draw_top_bar(&self, frame: &mut Frame, area: Rect) {
+        let mode_color = if self.awaiting_bookmark_slot {
+            parse_color(&self.effective.theme_colors.vars.bookmark_mode)
+        } else if self.search_mode != SearchMode::None {
+            parse_color(&self.effective.theme_colors.vars.search_mode)
+        } else if self.selection_mode {
+            parse_color(&self.effective.theme_colors.vars.selection_mode)
+        } else {
+            parse_color(&self.effective.theme_colors.vars.defult_panel_label)
+        };
+        let top_bar_fg = mode_color;
+        let top_bar_border = if self.awaiting_bookmark_slot || self.search_mode != SearchMode::None || self.selection_mode {
+            mode_color
+        } else {
+            parse_color(&self.effective.theme_colors.vars.defult_panel_border)
+        };
         let constraints = self.main_panel_constraints();
         let segments = Layout::default()
             .direction(Direction::Horizontal)
@@ -607,28 +653,41 @@ impl App {
 
         let mut seg_idx = 0;
         if self.effective.panels.sidebar {
-            let profile_name = self
-                .config
-                .profiles
-                .get(self.active_profile)
-                .map(|p| p.name.as_str())
-                .unwrap_or("default");
+            let (lhs, rhs) = if self.awaiting_bookmark_slot {
+                ("DIRT::".to_string(), "bookmark".to_string())
+            } else if self.search_mode != SearchMode::None {
+                ("DIRT::".to_string(), "search".to_string())
+            } else if self.selection_mode {
+                ("DIRT::".to_string(), "selection".to_string())
+            } else {
+                let profile_name = self
+                    .config
+                    .profiles
+                    .get(self.active_profile)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("default");
+                ("DIRT // ".to_string(), profile_name.to_string())
+            };
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        "DIRT // ",
+                        lhs,
                         Style::default()
-                            .fg(parse_color(&self.effective.ui_colors.accent))
+                            .fg(top_bar_fg)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        profile_name.to_string(),
-                        Style::default().fg(parse_color(&self.effective.ui_colors.foreground)),
+                        rhs,
+                        Style::default().fg(top_bar_fg),
                     ),
                 ]))
-                    .style(Style::default().fg(parse_color(&self.effective.ui_colors.search_bar)))
-                    .block(Block::default().borders(Borders::ALL))
-                    .style(Style::default().fg(parse_color(&self.effective.ui_colors.search_bar))),
+                    .style(Style::default().fg(top_bar_fg))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .padding(Padding::horizontal(1))
+                            .border_style(Style::default().fg(top_bar_border)),
+                    ),
                 segments[seg_idx],
             );
             seg_idx += 1;
@@ -651,8 +710,19 @@ impl App {
             };
             frame.render_widget(
                 Paragraph::new(label)
-                    .style(Style::default().fg(parse_color(&self.effective.ui_colors.search_bar)))
-                    .block(Block::default().borders(Borders::ALL)),
+                    .style(Style::default().fg(if self.search_mode != SearchMode::None {
+                        mode_color
+                    } else if self.selection_mode {
+                        parse_color(&self.effective.theme_colors.vars.secondary_fg)
+                    } else {
+                        top_bar_fg
+                    }))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .padding(Padding::horizontal(1))
+                            .border_style(Style::default().fg(top_bar_border)),
+                    ),
                 segments[seg_idx],
             );
             seg_idx += 1;
@@ -660,60 +730,118 @@ impl App {
 
         if self.effective.panels.preview {
             frame.render_widget(
-                Paragraph::new("")
-                    .style(Style::default().fg(parse_color(&self.effective.ui_colors.search_bar)))
-                    .block(Block::default().borders(Borders::ALL)),
+                Paragraph::new(format!("{} @ {}", self.user_name, self.device_name))
+                    .style(Style::default().fg(top_bar_fg))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .padding(Padding::horizontal(1))
+                            .border_style(Style::default().fg(top_bar_border)),
+                    ),
                 segments[seg_idx],
             );
         }
     }
 
     fn draw_sidebar(&self, frame: &mut Frame, area: Rect) {
+        let panel_fg = parse_color(&self.effective.theme_colors.vars.defult_panel_label);
+        let bookmark_fg = if self.awaiting_bookmark_slot {
+            parse_color(&self.effective.theme_colors.vars.bookmark_mode)
+        } else {
+            panel_fg
+        };
+        let sidebar_border = if self.awaiting_bookmark_slot {
+            parse_color(&self.effective.theme_colors.vars.bookmark_mode)
+        } else {
+            parse_color(&self.effective.theme_colors.vars.defult_panel_border)
+        };
         let mut rows = Vec::new();
 
         rows.push(ListItem::new(Line::from("Bookmarks").style(
             Style::default()
-                .fg(parse_color(&self.effective.ui_colors.sidebar_header))
+                .fg(bookmark_fg)
                 .add_modifier(Modifier::BOLD),
         )));
-        for b in &self.config.sidebar.bookmarks {
-            rows.push(ListItem::new(Line::from(format!("  {} -> {}", b.name, b.path)).style(
-                Style::default().fg(parse_color(&self.effective.ui_colors.foreground)),
-            )));
+        let mut bookmark_slots: Vec<(char, bool, String)> = Vec::new();
+        for slot in 1..=9 {
+            let slot_ch = char::from_digit(slot, 10).unwrap_or('1');
+            let exists = self
+                .config
+                .sidebar
+                .bookmarks
+                .iter()
+                .any(|b| bookmark_matches_slot(b, slot_ch));
+            if slot > 3 && !exists {
+                continue;
+            }
+            let title = self
+                .config
+                .sidebar
+                .bookmarks
+                .iter()
+                .find(|b| bookmark_matches_slot(b, slot_ch))
+                .map(|b| b.name.clone())
+                .unwrap_or_default();
+            bookmark_slots.push((slot_ch, exists, title));
+        }
+        // Keep drives visible by trimming bookmark rows when sidebar height is small.
+        let inner_h = area.height.saturating_sub(2) as usize;
+        let reserve_for_drives = 4usize; // blank + "Drives" + one drive row + spacer
+        let max_bookmark_rows = inner_h.saturating_sub(reserve_for_drives);
+        for (slot_ch, exists, title) in bookmark_slots.into_iter().take(max_bookmark_rows) {
+            let line = if exists {
+                let filled_color = if self.awaiting_bookmark_slot {
+                    parse_color(&self.effective.theme_colors.vars.bookmark_mode)
+                } else {
+                    parse_color(&self.effective.theme_colors.vars.primary_fg)
+                };
+                Line::from(vec![Span::styled(format!("  {title}"), Style::default().fg(filled_color))])
+            } else if self.awaiting_bookmark_slot {
+                Line::from(vec![Span::styled(
+                    format!("  {slot_ch}"),
+                    Style::default().fg(parse_color(&self.effective.theme_colors.vars.bookmark_mode)),
+                )])
+            } else {
+                Line::from(vec![Span::styled(
+                    format!("  ctrl+b+{slot_ch}"),
+                    Style::default().fg(parse_color(&self.effective.theme_colors.vars.secondary_fg)),
+                )])
+            };
+            rows.push(ListItem::new(line));
         }
 
         rows.push(ListItem::new(""));
         rows.push(ListItem::new(Line::from("Drives").style(
             Style::default()
-                .fg(parse_color(&self.effective.ui_colors.sidebar_header))
+                .fg(panel_fg)
                 .add_modifier(Modifier::BOLD),
         )));
-        for drive in &self.drives {
+        for drive in self.drives.iter().take(self.config.sidebar.drives_limit.max(1)) {
             rows.push(ListItem::new(Line::from(format!("  {}", drive)).style(
-                Style::default().fg(parse_color(&self.effective.ui_colors.sidebar_drive)),
+                Style::default().fg(panel_fg),
             )));
         }
 
         rows.push(ListItem::new(""));
         rows.push(ListItem::new(Line::from("Recent Dirs").style(
             Style::default()
-                .fg(parse_color(&self.effective.ui_colors.sidebar_header))
+                .fg(panel_fg)
                 .add_modifier(Modifier::BOLD),
         )));
-        for recent in &self.recents {
+        for recent in self.recents.iter().take(self.config.sidebar.recent_dirs_limit.max(1)) {
             rows.push(ListItem::new(Line::from(format!("  {}", recent.display())).style(
-                Style::default().fg(parse_color(&self.effective.ui_colors.sidebar_recent)),
+                Style::default().fg(panel_fg),
             )));
         }
 
         let list = List::new(rows).block(
             Block::default()
-                .title("Sidebar")
+                .title(Line::from("Sidebar").style(Style::default().fg(bookmark_fg)))
                 .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
                 .style(
                     Style::default()
-                        .fg(parse_color(&self.effective.ui_colors.accent))
-                        .bg(parse_color(&self.effective.ui_colors.background)),
+                        .fg(sidebar_border),
                 ),
         );
         frame.render_widget(list, area);
@@ -731,8 +859,7 @@ impl App {
             .borders(Borders::ALL)
             .style(
                 Style::default()
-                    .fg(parse_color(&self.effective.ui_colors.accent))
-                    .bg(parse_color(&self.effective.ui_colors.background)),
+                    .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
             );
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
@@ -744,45 +871,46 @@ impl App {
         if max_columns == 0 {
             return;
         }
-        let constraints = (0..max_columns).map(|_| Constraint::Fill(1)).collect::<Vec<_>>();
+        let ratio_total: u32 = self
+            .effective
+            .column_ratios
+            .iter()
+            .take(max_columns)
+            .map(|&x| x.max(1) as u32)
+            .sum();
+        let constraints = self
+            .effective
+            .column_ratios
+            .iter()
+            .take(max_columns)
+            .map(|&x| Constraint::Ratio(x.max(1) as u32, ratio_total.max(1)))
+            .collect::<Vec<_>>();
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
             .split(inner);
 
-        let active_render_idx = max_columns.saturating_sub(2);
+        let active_render_idx = self.effective.active_column.min(max_columns.saturating_sub(2));
         for idx in 0..max_columns {
             if idx == max_columns - 1 {
                 if self.columns.len() <= 1 {
-                    let p = Paragraph::new("YOU HAVE GONE TOO FAR!!!")
-                        .alignment(Alignment::Center)
-                        .block(
-                            Block::default()
-                                .title("Next")
-                                .borders(Borders::ALL)
-                                .style(
-                                    Style::default()
-                                        .fg(parse_color(&self.effective.ui_colors.accent))
-                                        .bg(parse_color(&self.effective.ui_colors.background)),
-                                ),
-                        );
+                    let p = Paragraph::new("").block(
+                        Block::default().borders(Borders::ALL).style(
+                            Style::default()
+                                .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
+                        ),
+                    );
                     frame.render_widget(p, chunks[idx]);
                 } else if let Some(selected_dir) = self.selected_dir_path() {
                     let preview_col = DirColumn::from_path(selected_dir.to_path_buf(), &self.effective);
                     if preview_col.entries.is_empty() {
-                        let p = Paragraph::new("YOU HAVE GONE TOO FAR!!!")
-                            .alignment(Alignment::Center)
-                            .block(
-                                Block::default()
-                                    .title("Next")
-                                    .borders(Borders::ALL)
-                                    .style(
-                                        Style::default()
-                                            .fg(parse_color(&self.effective.ui_colors.accent))
-                                            .bg(parse_color(&self.effective.ui_colors.background)),
-                                    ),
-                            );
-                        frame.render_widget(p, chunks[idx]);
+                        let block = Block::default().borders(Borders::ALL).style(
+                            Style::default()
+                                .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
+                        );
+                        let inner = block.inner(chunks[idx]);
+                        frame.render_widget(block, chunks[idx]);
+                        render_empty_dir_mascot(frame, inner, &self.effective.theme_colors);
                     } else {
                         let rows = preview_col
                             .entries
@@ -798,25 +926,18 @@ impl App {
                                 .borders(Borders::ALL)
                                 .style(
                                     Style::default()
-                                        .fg(parse_color(&self.effective.ui_colors.accent))
-                                        .bg(parse_color(&self.effective.ui_colors.background)),
+                                        .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
                                 ),
                         );
                         frame.render_widget(list, chunks[idx]);
                     }
                 } else {
-                    let p = Paragraph::new("YOU HAVE GONE TOO FAR!!!")
-                        .alignment(Alignment::Center)
-                        .block(
-                            Block::default()
-                                .title("Next")
-                                .borders(Borders::ALL)
-                                .style(
-                                    Style::default()
-                                        .fg(parse_color(&self.effective.ui_colors.accent))
-                                        .bg(parse_color(&self.effective.ui_colors.background)),
-                                ),
-                        );
+                    let p = Paragraph::new("").block(
+                        Block::default().borders(Borders::ALL).style(
+                            Style::default()
+                                .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
+                        ),
+                    );
                     frame.render_widget(p, chunks[idx]);
                 }
                 continue;
@@ -831,8 +952,7 @@ impl App {
                             .borders(Borders::ALL)
                             .style(
                                 Style::default()
-                                    .fg(parse_color(&self.effective.ui_colors.accent))
-                                    .bg(parse_color(&self.effective.ui_colors.background)),
+                                    .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
                             ),
                     );
                 frame.render_widget(p, chunks[idx]);
@@ -840,6 +960,7 @@ impl App {
             };
 
             let is_focused_column = idx == active_render_idx;
+            let col_theme = self.column_theme_for(idx);
             let is_locked_column = self
                 .locked_column_path
                 .as_ref()
@@ -855,6 +976,15 @@ impl App {
                 local_filtered_indices_with_query(&self.search_query, col)
             } else {
                 (0..col.entries.len()).collect::<Vec<_>>()
+            };
+            let mode_highlight_active =
+                self.awaiting_bookmark_slot || self.selection_mode || self.search_mode != SearchMode::None;
+            let mode_highlight_color = if self.awaiting_bookmark_slot {
+                &self.effective.theme_colors.vars.bookmark_mode
+            } else if self.search_mode != SearchMode::None {
+                &self.effective.theme_colors.vars.search_mode
+            } else {
+                &self.effective.theme_colors.vars.selection_mode
             };
             let viewport_height = chunks[idx].height.saturating_sub(2) as usize;
             let anchor_idx = if is_focused_column {
@@ -872,14 +1002,22 @@ impl App {
                 let absolute_idx = filtered_indices[filtered_row_idx];
                 let entry = &col.entries[absolute_idx];
                 let kind = if entry.is_dir { "/" } else { "" };
-                let base_fg = if entry.is_dir {
-                    parse_color(&self.effective.ui_colors.column_dir)
-                } else if entry.is_symlink {
-                    parse_color(&self.effective.ui_colors.column_symlink)
-                } else if entry.is_executable {
-                    parse_color(&self.effective.ui_colors.column_exec)
+                let base_fg = if is_focused_column {
+                    if mode_highlight_active {
+                        parse_color(mode_highlight_color)
+                    } else {
+                        if entry.is_dir {
+                            parse_color(&col_theme.dir)
+                        } else if entry.is_symlink {
+                            parse_color(&col_theme.symlink)
+                        } else if entry.is_executable {
+                            parse_color(&col_theme.executable)
+                        } else {
+                            parse_color(&col_theme.file)
+                        }
+                    }
                 } else {
-                    parse_color(&self.effective.ui_colors.column_file)
+                    parse_color(&self.effective.theme_colors.vars.defult_text)
                 };
                 let mut item = ListItem::new(format!(" {}{}", entry.name, kind))
                     .style(Style::default().fg(base_fg));
@@ -889,49 +1027,115 @@ impl App {
                         .map(|p| entry.path == p)
                         .unwrap_or(false);
                 if should_highlight {
+                    let (bg, fg) = if mode_highlight_active {
+                        (
+                            mode_highlight_color,
+                            &self.effective.theme_colors.vars.primary_bg,
+                        )
+                    } else if is_focused_column && absolute_idx == col.selected {
+                        (
+                            &self.effective.theme_colors.vars.focused_dir_bg,
+                            &self.effective.theme_colors.vars.focused_dir_text,
+                        )
+                    } else {
+                        (
+                            &self.effective.theme_colors.vars.active_dir_bg,
+                            &self.effective.theme_colors.vars.defult_text,
+                        )
+                    };
                     item = item.style(
                         Style::default()
-                            .bg(parse_color(&self.effective.ui_colors.selection_bg))
-                            .fg(parse_color(&self.effective.ui_colors.selection_fg)),
+                            .bg(parse_color(bg))
+                            .fg(parse_color(fg)),
                     );
                 } else if is_marked_selected {
                     item = item.style(
                         Style::default()
-                            .bg(parse_color(&self.effective.ui_colors.selection_entry))
-                            .fg(parse_color(&self.effective.ui_colors.foreground)),
+                            .bg(parse_color(&col_theme.selected_bg))
+                            .fg(if is_focused_column {
+                                if mode_highlight_active {
+                                    parse_color(mode_highlight_color)
+                                } else {
+                                    parse_color(&col_theme.selected_fg)
+                                }
+                            } else {
+                                parse_color(&self.effective.theme_colors.vars.defult_text)
+                            }),
                     );
                 } else if is_dimmed {
                     item = item.style(
                         Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
+                            .fg(parse_color(&self.effective.theme_colors.vars.defult_text)),
                     );
                 }
                 rows.push(item);
             }
             if filtered_indices.is_empty() {
-                rows.push(ListItem::new("  <empty>"));
-            }
-            let title = format!("/{}", path_last_segment(&col.path));
-            let list = List::new(rows).block(
-                Block::default()
+                let title = format!("/{}", path_last_segment(&col.path));
+                let block = Block::default()
                     .title(Line::from(title).style(Style::default().fg(parse_color(
-                        &self.effective.ui_colors.column_header,
+                        if is_focused_column && mode_highlight_active {
+                            mode_highlight_color
+                        } else if is_focused_column {
+                            &col_theme.header
+                        } else {
+                            &self.effective.theme_colors.vars.defult_panel_label
+                        },
                     ))))
                     .borders(Borders::ALL)
                     .style(
                         Style::default()
                             .fg(parse_color(if is_focused_column {
-                                &self.effective.ui_colors.accent
-                            } else if is_dimmed {
-                                &self.effective.ui_colors.dimmed_border
+                                if mode_highlight_active {
+                                    mode_highlight_color
+                                } else {
+                                    &col_theme.border
+                                }
                             } else {
-                                &self.effective.ui_colors.inactive_border
+                                &self.effective.theme_colors.vars.defult_panel_border
+                            })),
+                    );
+                let inner = block.inner(chunks[idx]);
+                frame.render_widget(block, chunks[idx]);
+                render_empty_dir_mascot(frame, inner, &self.effective.theme_colors);
+                continue;
+            }
+            let title = format!("/{}", path_last_segment(&col.path));
+            let list = List::new(rows).block(
+                Block::default()
+                    .title(Line::from(title).style(Style::default().fg(parse_color(
+                        if is_focused_column && mode_highlight_active {
+                            mode_highlight_color
+                        } else if is_focused_column {
+                            &col_theme.header
+                        } else {
+                            &self.effective.theme_colors.vars.defult_panel_label
+                        },
+                    ))))
+                    .borders(Borders::ALL)
+                    .style(
+                        Style::default()
+                            .fg(parse_color(if is_focused_column {
+                                if mode_highlight_active {
+                                    mode_highlight_color
+                                } else {
+                                    &col_theme.border
+                                }
+                            } else {
+                                &self.effective.theme_colors.vars.defult_panel_border
                             }))
-                            .bg(parse_color(&self.effective.ui_colors.background)),
                     ),
             );
             frame.render_widget(list, chunks[idx]);
+            if idx == active_render_idx && filtered_indices.len() > viewport_height && viewport_height > 0 {
+                let mut state = ScrollbarState::new(filtered_indices.len()).position(start);
+                frame.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .thumb_style(Style::default().fg(parse_color(&col_theme.scrollbar))),
+                    chunks[idx],
+                    &mut state,
+                );
+            }
         }
     }
 
@@ -1048,6 +1252,7 @@ impl App {
         let path = selected.path.clone();
         self.columns.push(DirColumn::from_path(path.clone(), &self.effective));
         self.current_dir = path;
+        self.track_recent_dir();
         self.clear_simple_selection();
     }
 
@@ -1058,8 +1263,77 @@ impl App {
         self.columns.pop();
         if let Some(col) = self.columns.last() {
             self.current_dir = col.path.clone();
+            self.track_recent_dir();
         }
         self.clear_simple_selection();
+    }
+
+    fn set_bookmark_slot(&mut self, slot: char) {
+        let target_path = self
+            .selected_dir_path()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.current_dir.clone());
+        if !target_path.is_dir() {
+            self.status_message = "bookmark target must be a directory".to_string();
+            return;
+        }
+        let target = target_path.display().to_string();
+        let label = path_last_segment(&target_path);
+        let slot_num = slot.to_digit(10).map(|n| n as u8);
+        if let Some(existing) = self
+            .config
+            .sidebar
+            .bookmarks
+            .iter()
+            .find(|b| bookmark_matches_slot(b, slot))
+        {
+            if existing.path != target {
+                self.dialog = Some(DialogState::ConfirmBookmarkOverwrite {
+                    slot,
+                    existing_path: existing.path.clone(),
+                    new_path: target,
+                    yes_selected: true,
+                });
+                return;
+            }
+        } else {
+            self.config.sidebar.bookmarks.push(Bookmark {
+                slot: slot_num,
+                name: label,
+                path: target,
+            });
+            self.status_message = format!("set bookmark {slot}");
+            return;
+        }
+        self.status_message = format!("bookmark {slot} unchanged");
+    }
+
+    fn open_bookmark_slot(&mut self, slot: char) {
+        let Some(path_raw) = self
+            .config
+            .sidebar
+            .bookmarks
+            .iter()
+            .find(|b| bookmark_matches_slot(b, slot))
+            .map(|b| b.path.clone())
+        else {
+            self.status_message = format!("bookmark {slot} is empty");
+            return;
+        };
+        let target = expand_tilde(&path_raw);
+        if !target.is_dir() {
+            self.status_message = format!("bookmark {slot} is invalid");
+            return;
+        }
+        self.current_dir = target.clone();
+        self.columns = build_columns_from_path(&target, &self.effective);
+        self.track_recent_dir();
+        self.search_mode = SearchMode::None;
+        self.search_query.clear();
+        self.global_results.clear();
+        self.global_selected = 0;
+        self.clear_simple_selection();
+        self.status_message = format!("opened bookmark {slot}");
     }
 
     fn current_file_count(&self) -> usize {
@@ -1084,6 +1358,7 @@ impl App {
     fn reinitialize_columns(&mut self) {
         self.columns = build_columns_from_path(&self.effective.start_dir, &self.effective);
         self.current_dir = self.effective.start_dir.clone();
+        self.track_recent_dir();
     }
 
     fn reinitialize_columns_preserve_current(&mut self) {
@@ -1094,22 +1369,54 @@ impl App {
         };
         self.columns = build_columns_from_path(&target, &self.effective);
         self.current_dir = target;
+        self.track_recent_dir();
     }
 
     fn draw_details_panel(&self, frame: &mut Frame, area: Rect) {
+        let details_color = if self.search_mode != SearchMode::None {
+            parse_color(&self.effective.theme_colors.vars.search_mode)
+        } else if self.selection_mode {
+            parse_color(&self.effective.theme_colors.vars.selection_mode)
+        } else {
+            parse_color(&self.effective.theme_colors.vars.defult_panel_border)
+        };
+        let details_title_color = if self.search_mode != SearchMode::None {
+            parse_color(&self.effective.theme_colors.vars.search_mode)
+        } else if self.selection_mode {
+            parse_color(&self.effective.theme_colors.vars.selection_mode)
+        } else {
+            parse_color(&self.effective.theme_colors.vars.defult_panel_label)
+        };
+        if let Some(path) = self.selected_dir_path() {
+            if read_dir_entries(path, &self.effective).is_empty() {
+                let block = Block::default()
+                    .title(Line::from("Details").style(Style::default().fg(details_title_color)))
+                    .borders(Borders::ALL)
+                    .padding(Padding::horizontal(1))
+                    .style(
+                        Style::default()
+                            .fg(details_color),
+                    );
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                render_empty_dir_mascot(frame, inner, &self.effective.theme_colors);
+                return;
+            }
+        }
         let details_text = match self.current_preview() {
             PreviewData::Empty => vec![Line::from("No selection")],
             PreviewData::Details(content) => content,
         };
         let p = Paragraph::new(details_text)
+            .style(Style::default().fg(parse_color(&self.effective.theme_colors.vars.defult_panel_label)))
             .block(
                 Block::default()
-                    .title("Details")
+                    .title(Line::from("Details").style(Style::default().fg(details_title_color)))
                     .borders(Borders::ALL)
+                    .padding(Padding::horizontal(1))
                     .style(
                         Style::default()
-                            .fg(parse_color(&self.effective.ui_colors.accent))
-                            .bg(parse_color(&self.effective.ui_colors.background)),
+                            .fg(details_color),
                     ),
             );
         frame.render_widget(p, area);
@@ -1122,21 +1429,22 @@ impl App {
             .get(self.active_profile)
             .map(|p| p.name.as_str())
             .unwrap_or("default");
-        let sep = Span::styled(" · ", Style::default().fg(parse_color(&self.effective.ui_colors.status_meta)));
+        let panel_fg = parse_color(&self.effective.theme_colors.vars.defult_panel_label);
+        let sep = Span::styled(" · ", Style::default().fg(panel_fg));
         let mut spans = vec![
             Span::styled(
                 self.current_dir.display().to_string(),
-                Style::default().fg(parse_color(&self.effective.ui_colors.status_bar)),
+                Style::default().fg(panel_fg),
             ),
             sep.clone(),
             Span::styled(
                 format!("files: {}", self.current_file_count()),
-                Style::default().fg(parse_color(&self.effective.ui_colors.status_meta)),
+                Style::default().fg(panel_fg),
             ),
             sep.clone(),
             Span::styled(
                 format!("selected: {}", self.selected_name()),
-                Style::default().fg(parse_color(&self.effective.ui_colors.status_meta)),
+                Style::default().fg(panel_fg),
             ),
             sep.clone(),
             Span::styled(
@@ -1145,21 +1453,17 @@ impl App {
                 } else {
                     "select_mode: off".to_string()
                 },
-                Style::default().fg(parse_color(if self.selection_mode {
-                    &self.effective.ui_colors.status_selection_mode
-                } else {
-                    &self.effective.ui_colors.status_meta
-                })),
+                Style::default().fg(panel_fg),
             ),
             sep.clone(),
             Span::styled(
                 format!("git: {}", self.git_status_text()),
-                Style::default().fg(parse_color(&self.effective.ui_colors.accent)),
+                Style::default().fg(panel_fg),
             ),
             sep.clone(),
             Span::styled(
                 format!("profile: {}", profile_name),
-                Style::default().fg(parse_color(&self.effective.ui_colors.status_profile)),
+                Style::default().fg(panel_fg),
             ),
             sep,
             Span::styled(
@@ -1168,16 +1472,24 @@ impl App {
                 } else {
                     self.status_message.clone()
                 },
-                Style::default().fg(parse_color(&self.effective.ui_colors.status_meta)),
+                Style::default().fg(panel_fg),
             ),
         ];
-        frame.render_widget(Paragraph::new(Line::from(std::mem::take(&mut spans))), area);
+        frame.render_widget(
+            Paragraph::new(Line::from(std::mem::take(&mut spans))).block(
+                Block::default().borders(Borders::TOP).border_style(
+                    Style::default().fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
+                ),
+            ),
+            area,
+        );
     }
 
     fn draw_keymap_bar(&self, frame: &mut Frame, area: Rect) {
-        let key = |t: &str| Span::styled(t.to_string(), Style::default().fg(parse_color(&self.effective.ui_colors.keymap_key)));
-        let label = |t: &str| Span::styled(t.to_string(), Style::default().fg(parse_color(&self.effective.ui_colors.keymap_label)));
-        let sep = Span::styled(" · ".to_string(), Style::default().fg(parse_color(&self.effective.ui_colors.keymap_label)));
+        let panel_fg = parse_color(&self.effective.theme_colors.vars.defult_panel_label);
+        let key = |t: &str| Span::styled(t.to_string(), Style::default().fg(panel_fg));
+        let label = |t: &str| Span::styled(t.to_string(), Style::default().fg(panel_fg));
+        let sep = Span::styled(" · ".to_string(), Style::default().fg(panel_fg));
         let line = if self.selection_mode {
             Line::from(vec![
                 key(&self.keymap.selection.toggle), label(" select/deselect"), sep.clone(),
@@ -1198,7 +1510,14 @@ impl App {
                 key(&self.keymap.app.quit), label(" quit"),
             ])
         };
-        frame.render_widget(Paragraph::new(line), area);
+        frame.render_widget(
+            Paragraph::new(line).block(
+                Block::default().borders(Borders::TOP).border_style(
+                    Style::default().fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
+                ),
+            ),
+            area,
+        );
     }
 
     fn draw_dialog(&self, frame: &mut Frame) {
@@ -1241,8 +1560,39 @@ impl App {
                                 .borders(Borders::ALL)
                                 .style(
                                     Style::default()
-                                        .bg(parse_color(&self.effective.ui_colors.background))
-                                        .fg(parse_color(&self.effective.ui_colors.foreground)),
+                                        .bg(parse_color(&self.effective.theme_colors.vars.primary_bg))
+                                        .fg(parse_color(&self.effective.theme_colors.vars.primary_fg)),
+                                ),
+                        ),
+                    popup_area,
+                );
+            }
+            DialogState::ConfirmBookmarkOverwrite {
+                slot,
+                existing_path,
+                new_path,
+                yes_selected,
+            } => {
+                let yes = if *yes_selected { "[ YES ]" } else { "  YES  " };
+                let no = if !*yes_selected { "[ NO ]" } else { "  NO  " };
+                let text = format!(
+                    "Overwrite bookmark {slot}?\n\nold: {}\nnew: {}\n\n{}    {}\n\nEnter confirm · Esc cancel",
+                    existing_path,
+                    new_path,
+                    yes,
+                    no
+                );
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .alignment(Alignment::Center)
+                        .block(
+                            Block::default()
+                                .title("Confirm Bookmark Overwrite")
+                                .borders(Borders::ALL)
+                                .style(
+                                    Style::default()
+                                        .bg(parse_color(&self.effective.theme_colors.vars.primary_bg))
+                                        .fg(parse_color(&self.effective.theme_colors.vars.primary_fg)),
                                 ),
                         ),
                     popup_area,
@@ -1296,13 +1646,23 @@ impl App {
             return self
                 .global_results
                 .get(self.global_selected)
-                .map(|p| preview_for_path(p, &self.effective.ui_colors))
+                .map(|p| preview_for_path(
+                    p,
+                    &self.effective.theme_colors,
+                    self.selection_mode,
+                    self.search_mode != SearchMode::None,
+                ))
                 .unwrap_or(PreviewData::Empty);
         }
         let Some(entry) = self.selected_entry() else {
             return PreviewData::Empty;
         };
-        preview_for_path(&entry.path, &self.effective.ui_colors)
+        preview_for_path(
+            &entry.path,
+            &self.effective.theme_colors,
+            self.selection_mode,
+            self.search_mode != SearchMode::None,
+        )
     }
 
     fn git_status_text(&self) -> String {
@@ -1334,8 +1694,7 @@ impl App {
             .borders(Borders::ALL)
             .style(
                 Style::default()
-                    .fg(parse_color(&self.effective.ui_colors.accent))
-                    .bg(parse_color(&self.effective.ui_colors.background)),
+                    .fg(parse_color(&self.effective.theme_colors.col_1.border)),
             );
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
@@ -1353,8 +1712,8 @@ impl App {
             if idx == self.global_selected {
                 item = item.style(
                     Style::default()
-                        .bg(parse_color(&self.effective.ui_colors.selection_bg))
-                        .fg(parse_color(&self.effective.ui_colors.selection_fg)),
+                        .bg(parse_color(&self.effective.theme_colors.col_1.selected_bg))
+                        .fg(parse_color(&self.effective.theme_colors.col_1.selected_fg)),
                 );
             }
             rows.push(item);
@@ -1388,6 +1747,32 @@ fn local_filtered_indices_with_query(query: &str, col: &DirColumn) -> Vec<usize>
                 }
             })
             .collect()
+}
+
+fn bookmark_slot_from_key(key: crossterm::event::KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c) if ('1'..='9').contains(&c) => Some(c),
+        // Some terminals encode Ctrl+number as shifted symbols.
+        KeyCode::Char('!') => Some('1'),
+        KeyCode::Char('@') => Some('2'),
+        KeyCode::Char('#') => Some('3'),
+        KeyCode::Char('$') => Some('4'),
+        KeyCode::Char('%') => Some('5'),
+        KeyCode::Char('^') => Some('6'),
+        KeyCode::Char('&') => Some('7'),
+        KeyCode::Char('*') => Some('8'),
+        KeyCode::Char('(') => Some('9'),
+        _ => None,
+    }
+}
+
+fn bookmark_matches_slot(bookmark: &Bookmark, slot: char) -> bool {
+    if let Some(s) = bookmark.slot
+        && let Some(sc) = char::from_digit(s as u32, 10)
+    {
+        return sc == slot;
+    }
+    bookmark.name == format!("slot-{slot}")
 }
 
 impl App {
@@ -1424,6 +1809,16 @@ impl App {
                         self.status_message = match init_config_file() {
                             Ok(msg) => msg,
                             Err(e) => format!("config init failed: {e}"),
+                        };
+                    } else if cmd == "config layout init" || cmd == "/config layout init" {
+                        self.status_message = match init_layout_file() {
+                            Ok(msg) => msg,
+                            Err(e) => format!("config layout init failed: {e}"),
+                        };
+                    } else if cmd == "config theme init" || cmd == "/config theme init" {
+                        self.status_message = match init_theme_file() {
+                            Ok(msg) => msg,
+                            Err(e) => format!("config theme init failed: {e}"),
                         };
                     } else if cmd == "keymap init" || cmd == "/keymap init" {
                         self.status_message = match init_keymap_file() {
@@ -1487,6 +1882,7 @@ impl App {
         };
         self.current_dir = target_dir.clone();
         self.columns = build_columns_from_path(&target_dir, &self.effective);
+        self.track_recent_dir();
         self.search_mode = SearchMode::None;
         self.search_query.clear();
         self.global_results.clear();
@@ -1663,36 +2059,77 @@ impl App {
                 KeyCode::Enter => self.confirm_dialog(),
                 _ => {}
             },
+            DialogState::ConfirmBookmarkOverwrite { yes_selected, .. } => match key.code {
+                KeyCode::Left | KeyCode::Char('h') => *yes_selected = true,
+                KeyCode::Right | KeyCode::Char('l') => *yes_selected = false,
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    *yes_selected = true;
+                    self.confirm_dialog();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.dialog = None;
+                    self.status_message = "bookmark overwrite canceled".to_string();
+                }
+                KeyCode::Enter => self.confirm_dialog(),
+                _ => {}
+            },
         }
     }
 
     fn confirm_dialog(&mut self) {
-        let Some(DialogState::ConfirmDelete {
-            paths,
-            yes_selected,
-        }) = self.dialog.take()
-        else {
+        let Some(dialog) = self.dialog.take() else {
             return;
         };
-        if !yes_selected {
-            self.status_message = "delete canceled".to_string();
-            return;
-        }
-        let mut ok_count = 0usize;
-        let mut fail_count = 0usize;
-        for path in &paths {
-            match trash::delete(path) {
-                Ok(_) => ok_count += 1,
-                Err(_) => fail_count += 1,
+        match dialog {
+            DialogState::ConfirmDelete { paths, yes_selected } => {
+                if !yes_selected {
+                    self.status_message = "delete canceled".to_string();
+                    return;
+                }
+                let mut ok_count = 0usize;
+                let mut fail_count = 0usize;
+                for path in &paths {
+                    match trash::delete(path) {
+                        Ok(_) => ok_count += 1,
+                        Err(_) => fail_count += 1,
+                    }
+                }
+                self.clear_all_selection();
+                self.status_message = if fail_count == 0 {
+                    format!("trashed {} item(s)", ok_count)
+                } else {
+                    format!("trash: {} ok, {} failed", ok_count, fail_count)
+                };
+                self.refresh_active_column();
+            }
+            DialogState::ConfirmBookmarkOverwrite {
+                slot,
+                new_path,
+                yes_selected,
+                ..
+            } => {
+                if !yes_selected {
+                    self.status_message = "bookmark overwrite canceled".to_string();
+                    return;
+                }
+                let slot_num = slot.to_digit(10).map(|n| n as u8);
+                let label = path_last_segment(Path::new(&new_path));
+                if let Some(existing) = self
+                    .config
+                    .sidebar
+                    .bookmarks
+                    .iter_mut()
+                    .find(|b| bookmark_matches_slot(b, slot))
+                {
+                    existing.slot = slot_num;
+                    existing.name = label;
+                    existing.path = new_path;
+                    self.status_message = format!("updated bookmark {slot}");
+                } else {
+                    self.status_message = format!("bookmark {slot} not found");
+                }
             }
         }
-        self.clear_all_selection();
-        self.status_message = if fail_count == 0 {
-            format!("trashed {} item(s)", ok_count)
-        } else {
-            format!("trash: {} ok, {} failed", ok_count, fail_count)
-        };
-        self.refresh_active_column();
     }
 
     fn refresh_active_column(&mut self) {
@@ -1704,6 +2141,19 @@ impl App {
                 col.selected = col.entries.len() - 1;
             }
         }
+    }
+
+    fn track_recent_dir(&mut self) {
+        if !self.current_dir.is_dir() {
+            return;
+        }
+        self.recents.retain(|p| p != &self.current_dir);
+        self.recents.insert(0, self.current_dir.clone());
+        let keep = self.config.sidebar.recent_dirs_limit.max(1);
+        if self.recents.len() > keep {
+            self.recents.truncate(keep);
+        }
+        let _ = save_recents(&self.recents);
     }
 
     fn toggle_focused_selection(&mut self) {
@@ -1826,6 +2276,12 @@ impl App {
     }
 
     fn handle_selection_mode_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.awaiting_bookmark_slot
+            && let Some(slot) = bookmark_slot_from_key(key)
+        {
+            self.set_bookmark_slot(slot);
+            return;
+        }
         match key.code {
             KeyCode::Esc => self.exit_selection_mode(),
             KeyCode::Char(' ') if key.modifiers.is_empty() => self.toggle_focused_selection(),
@@ -1838,6 +2294,18 @@ impl App {
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => self.cut_selected(),
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => self.paste_clipboard(),
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => self.request_delete_to_trash(),
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.awaiting_bookmark_slot = true;
+                self.status_message = "bookmark set mode: press 1-9".to_string();
+            }
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL) && ('1'..='9').contains(&c) =>
+            {
+                self.open_bookmark_slot(c);
+            }
+            KeyCode::Char(c) if key.modifiers.is_empty() && ('1'..='9').contains(&c) => {
+                self.open_bookmark_slot(c);
+            }
             KeyCode::Char('n') if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
                 self.start_new_dir()
             }
@@ -1936,6 +2404,20 @@ fn config_path() -> PathBuf {
     path
 }
 
+fn layout_config_path() -> PathBuf {
+    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("dirt");
+    path.push("layout.toml");
+    path
+}
+
+fn theme_config_path() -> PathBuf {
+    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("dirt");
+    path.push("theme.toml");
+    path
+}
+
 fn keymap_path() -> PathBuf {
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("dirt");
@@ -1971,10 +2453,21 @@ fn load_recents() -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RecentsState {
     #[serde(default)]
     recent_dirs: Vec<String>,
+}
+
+fn save_recents(recents: &[PathBuf]) -> io::Result<()> {
+    let mut recents_path = state_dir();
+    fs::create_dir_all(&recents_path)?;
+    recents_path.push("recents.toml");
+    let state = RecentsState {
+        recent_dirs: recents.iter().map(|p| p.display().to_string()).collect(),
+    };
+    let body = toml::to_string(&state).unwrap_or_else(|_| String::from("recent_dirs = []\n"));
+    fs::write(recents_path, body)
 }
 
 fn discover_drives() -> Vec<String> {
@@ -2016,8 +2509,30 @@ fn discover_drives() -> Vec<String> {
     }
 }
 
+fn user_device_names() -> (String, String) {
+    let user = env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "user".to_string());
+    let device = Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "device".to_string());
+    (user, device)
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_recent_dirs_limit() -> usize {
+    10
+}
+
+fn default_drives_limit() -> usize {
+    10
 }
 
 fn default_panels() -> Panels {
@@ -2028,35 +2543,6 @@ fn default_panels() -> Panels {
         search_bar: true,
         status_bar: true,
         keymap_bar: true,
-    }
-}
-
-fn default_ui_colors() -> UiColors {
-    UiColors {
-        background: default_color_bg(),
-        foreground: default_color_fg(),
-        accent: default_color_accent(),
-        status_bar: default_color_status(),
-        keymap_bar: default_color_keymap(),
-        search_bar: default_color_search(),
-        selection_bg: default_color_selection_bg(),
-        selection_fg: default_color_selection_fg(),
-        selection_entry: default_color_selection_entry(),
-        inactive_border: default_color_inactive_border(),
-        dimmed_border: default_color_dimmed_border(),
-        sidebar_header: default_color_sidebar_header(),
-        sidebar_drive: default_color_sidebar_drive(),
-        sidebar_recent: default_color_sidebar_recent(),
-        column_header: default_color_column_header(),
-        column_dir: default_color_column_dir(),
-        column_file: default_color_column_file(),
-        column_symlink: default_color_column_symlink(),
-        column_exec: default_color_column_exec(),
-        status_meta: default_color_status_meta(),
-        status_profile: default_color_status_profile(),
-        status_selection_mode: default_color_status_selection_mode(),
-        keymap_label: default_color_keymap_label(),
-        keymap_key: default_color_keymap_key(),
     }
 }
 
@@ -2107,107 +2593,19 @@ fn default_max_columns() -> usize {
     4
 }
 
+fn default_active_column() -> usize {
+    2
+}
+
+fn default_column_ratios() -> Vec<u16> {
+    vec![1, 1, 1, 1]
+}
+
 fn default_search_max_depth() -> usize {
     6
 }
 
-fn default_color_bg() -> String {
-    "black".to_string()
-}
-
-fn default_color_fg() -> String {
-    "white".to_string()
-}
-
-fn default_color_accent() -> String {
-    "gray".to_string()
-}
-
-fn default_color_status() -> String {
-    "white".to_string()
-}
-
-fn default_color_keymap() -> String {
-    "gray".to_string()
-}
-
-fn default_color_search() -> String {
-    "white".to_string()
-}
-
-fn default_color_selection_bg() -> String {
-    "white".to_string()
-}
-
-fn default_color_selection_fg() -> String {
-    "black".to_string()
-}
-
-fn default_color_selection_entry() -> String {
-    "darkgray".to_string()
-}
-
-fn default_color_inactive_border() -> String {
-    "#2A2A2A".to_string()
-}
-
-fn default_color_dimmed_border() -> String {
-    "#1C1C1C".to_string()
-}
-
-fn default_color_sidebar_header() -> String {
-    default_color_accent()
-}
-
-fn default_color_sidebar_drive() -> String {
-    default_color_selection_entry()
-}
-
-fn default_color_sidebar_recent() -> String {
-    default_color_selection_entry()
-}
-
-fn default_color_column_header() -> String {
-    default_color_selection_entry()
-}
-
-fn default_color_column_dir() -> String {
-    default_color_accent()
-}
-
-fn default_color_column_file() -> String {
-    default_color_fg()
-}
-
-fn default_color_column_symlink() -> String {
-    "#94E0E0".to_string()
-}
-
-fn default_color_column_exec() -> String {
-    "#84E052".to_string()
-}
-
-fn default_color_status_meta() -> String {
-    default_color_selection_entry()
-}
-
-fn default_color_status_profile() -> String {
-    default_color_selection_entry()
-}
-
-fn default_color_status_selection_mode() -> String {
-    "#EB8D47".to_string()
-}
-
-fn default_color_keymap_label() -> String {
-    default_color_selection_entry()
-}
-
-fn default_color_keymap_key() -> String {
-    default_color_accent()
-}
-
-fn parse_color(name: &str) -> Color {
+pub(crate) fn parse_color(name: &str) -> Color {
     if let Some(hex) = name.strip_prefix('#')
         && hex.len() == 6
         && let (Ok(r), Ok(g), Ok(b)) = (
@@ -2252,7 +2650,45 @@ fn path_last_segment(path: &Path) -> String {
 }
 
 fn build_columns_from_path(path: &Path, settings: &EffectiveSettings) -> Vec<DirColumn> {
-    vec![DirColumn::from_path(path.to_path_buf(), settings)]
+    let target_dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+
+    let mut chain = Vec::new();
+    let mut cur = target_dir.clone();
+    loop {
+        chain.push(cur.clone());
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if parent == cur {
+            break;
+        }
+        cur = parent.to_path_buf();
+    }
+    chain.reverse();
+
+    let mut cols = chain
+        .iter()
+        .map(|p| DirColumn::from_path(p.clone(), settings))
+        .collect::<Vec<_>>();
+
+    for idx in 0..cols.len().saturating_sub(1) {
+        let child = &chain[idx + 1];
+        if let Some(selected_idx) = cols[idx].entries.iter().position(|e| &e.path == child) {
+            cols[idx].selected = selected_idx;
+        }
+    }
+
+    if cols.is_empty() {
+        vec![DirColumn::from_path(target_dir, settings)]
+    } else {
+        cols
+    }
 }
 
 fn read_dir_entries(path: &Path, settings: &EffectiveSettings) -> Vec<DirEntry> {
@@ -2330,27 +2766,33 @@ fn extension_of(name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn preview_for_path(path: &Path, colors: &UiColors) -> PreviewData {
-    let label = |k: &str| Span::styled(format!("{k}: "), Style::default().fg(parse_color(&colors.status_meta)));
-    let val = |v: String| Span::styled(v, Style::default().fg(parse_color(&colors.foreground)));
+fn preview_for_path(path: &Path, colors: &Theme, selection_mode: bool, search_mode: bool) -> PreviewData {
+    let text_color = if search_mode {
+        parse_color(&colors.vars.search_mode)
+    } else if selection_mode {
+        parse_color(&colors.vars.selection_mode)
+    } else {
+        parse_color(&colors.preview.value)
+    };
+    let label_color = if search_mode {
+        parse_color(&colors.vars.search_mode)
+    } else if selection_mode {
+        parse_color(&colors.vars.selection_mode)
+    } else {
+        parse_color(&colors.preview.label)
+    };
+    let label = |k: &str| Span::styled(format!("{k}: "), Style::default().fg(label_color));
+    let val = |v: String| Span::styled(v, Style::default().fg(text_color));
     let bool_span = |b: bool| {
         if b {
-            Span::styled("true", Style::default().fg(parse_color("#84E052")))
+            Span::styled("true", Style::default().fg(parse_color(&colors.vars.bool_yes)))
         } else {
-            Span::styled("false", Style::default().fg(parse_color(&colors.status_meta)))
+            Span::styled("false", Style::default().fg(parse_color(&colors.vars.bool_no)))
         }
     };
     let mut lines = Vec::new();
     lines.push(Line::from(vec![label("name"), val(path_last_segment(path))]));
     lines.push(Line::from(vec![label("path"), val(path.display().to_string())]));
-    lines.push(Line::from(vec![
-        label("canonical_path"),
-        val(
-            fs::canonicalize(path)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "-".to_string()),
-        ),
-    ]));
 
     let Ok(meta) = fs::metadata(path) else {
         lines.push(Line::from(vec![label("metadata"), val("unavailable".to_string())]));
@@ -2366,9 +2808,8 @@ fn preview_for_path(path: &Path, colors: &UiColors) -> PreviewData {
 
     let file_type = meta.file_type();
     let link_type = link_meta.file_type();
-    lines.push(Line::from(vec![label("is_dir"), bool_span(file_type.is_dir())]));
-    lines.push(Line::from(vec![label("is_file"), bool_span(file_type.is_file())]));
-    lines.push(Line::from(vec![label("is_symlink"), bool_span(link_type.is_symlink())]));
+    lines.push(Line::from(vec![label("is dir"), bool_span(file_type.is_dir())]));
+    lines.push(Line::from(vec![label("is symlink"), bool_span(link_type.is_symlink())]));
     lines.push(Line::from(vec![label("size"), val(format_size(meta.len()))]));
     lines.push(Line::from(vec![
         label("readonly"),
@@ -2560,183 +3001,37 @@ fn move_path(source: &Path, destination: &Path) -> io::Result<()> {
     }
 }
 
-fn ensure_default_themes() -> io::Result<()> {
-    let dir = themes_dir();
-    fs::create_dir_all(&dir)?;
-
-    let mut dark = dir.clone();
-    dark.push("dark.toml");
-    if !dark.exists() {
-        fs::write(
-            dark,
-            r##"[vars]
-primary_bg   = "#0D0D0D"
-secondary_bg = "#1A1A1A"
-accent       = "#13B5B7"
-active       = "#FCFCFC"
-primary_fg   = "#E0E0E0"
-secondary_fg = "#888888"
-
-[borders]
-active   = "$accent"
-inactive = "#2A2A2A"
-dimmed   = "#1C1C1C"
-
-[sidebar]
-background     = "$secondary_bg"
-section_header = "$accent"
-bookmark_fg    = "$primary_fg"
-drive_fg       = "$secondary_fg"
-recent_fg      = "$secondary_fg"
-selected_bg    = "#2A2A2A"
-selected_fg    = "$active"
-
-[columns]
-background    = "$primary_bg"
-column_header = "$secondary_fg"
-focused_bg    = "#141414"
-dimmed_fg     = "#333333"
-[columns.file]
-default    = "$primary_fg"
-dir        = "$accent"
-symlink    = "#94E0E0"
-executable = "#84E052"
-[columns.selected]
-bg = "#1F1F1F"
-fg = "$active"
-
-[status_bar]
-path_fg           = "$active"
-meta_fg           = "$secondary_fg"
-git_fg            = "$accent"
-profile_fg        = "$secondary_fg"
-selection_mode_fg = "#EB8D47"
-
-[keymap_bar]
-key_fg     = "$accent"
-label_fg   = "$secondary_fg"
-
-[search_bar]
-text_fg     = "$primary_fg"
-
-[selection]
-bg       = "#1F3A3A"
-fg       = "$active"
-"##,
-        )?;
-    }
-
-    let mut bark_red = dir;
-    bark_red.push("bark-red.toml");
-    if !bark_red.exists() {
-        fs::write(
-            bark_red,
-            r##"[ui_colors]
-background = "black"
-foreground = "white"
-accent = "red"
-status_bar = "green"
-keymap_bar = "yellow"
-search_bar = "magenta"
-selection_bg = "red"
-selection_fg = "black"
-selection_entry = "darkgray"
-"##,
-        )?;
-    }
-    Ok(())
-}
-
 fn load_themes_registry() -> Result<ThemeRegistry> {
-    let dir = themes_dir();
     let mut by_name = HashMap::new();
-    if !dir.exists() {
-        return Ok(ThemeRegistry { by_name });
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("toml") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else {
-            continue;
-        };
-        let raw = fs::read_to_string(&path)?;
-        if let Ok(value) = toml::from_str::<toml::Value>(&raw) {
-            by_name.insert(stem.to_string(), ui_colors_from_theme_value(&value));
-        }
-    }
+    by_name.insert("dark".to_string(), load_default_theme_fallback());
     Ok(ThemeRegistry { by_name })
 }
 
-fn ui_colors_from_theme_value(value: &toml::Value) -> UiColors {
-    let mut out = default_ui_colors();
-    let vars = theme_vars(value);
-    out.background = theme_color(value, &vars, "vars.primary_bg", &out.background);
-    out.foreground = theme_color(value, &vars, "vars.primary_fg", &out.foreground);
-    out.accent = theme_color(value, &vars, "borders.active", &out.accent);
-    out.inactive_border = theme_color(value, &vars, "borders.inactive", &out.inactive_border);
-    out.dimmed_border = theme_color(value, &vars, "borders.dimmed", &out.dimmed_border);
-    out.search_bar = theme_color(value, &vars, "search_bar.text_fg", &out.search_bar);
-    out.status_bar = theme_color(value, &vars, "status_bar.path_fg", &out.status_bar);
-    out.keymap_bar = theme_color(value, &vars, "keymap_bar.key_fg", &out.keymap_bar);
-    out.selection_bg = theme_color(value, &vars, "columns.selected.bg", &out.selection_bg);
-    out.selection_fg = theme_color(value, &vars, "columns.selected.fg", &out.selection_fg);
-    out.selection_entry = theme_color(value, &vars, "selection.bg", &out.selection_entry);
-    out.sidebar_header = theme_color(value, &vars, "sidebar.section_header", &out.sidebar_header);
-    out.sidebar_drive = theme_color(value, &vars, "sidebar.drive_fg", &out.sidebar_drive);
-    out.sidebar_recent = theme_color(value, &vars, "sidebar.recent_fg", &out.sidebar_recent);
-    out.column_header = theme_color(value, &vars, "columns.column_header", &out.column_header);
-    out.column_dir = theme_color(value, &vars, "columns.file.dir", &out.column_dir);
-    out.column_file = theme_color(value, &vars, "columns.file.default", &out.column_file);
-    out.column_symlink = theme_color(value, &vars, "columns.file.symlink", &out.column_symlink);
-    out.column_exec = theme_color(value, &vars, "columns.file.executable", &out.column_exec);
-    out.status_meta = theme_color(value, &vars, "status_bar.meta_fg", &out.status_meta);
-    out.status_profile = theme_color(value, &vars, "status_bar.profile_fg", &out.status_profile);
-    out.status_selection_mode = theme_color(
-        value,
-        &vars,
-        "status_bar.selection_mode_fg",
-        &out.status_selection_mode,
-    );
-    out.keymap_key = theme_color(value, &vars, "keymap_bar.key_fg", &out.keymap_key);
-    out.keymap_label = theme_color(value, &vars, "keymap_bar.label_fg", &out.keymap_label);
-    out
+fn load_default_theme_fallback() -> Theme {
+    let path = PathBuf::from("defaults/theme.toml");
+    if let Ok(raw) = fs::read_to_string(path)
+        && let Ok(value) = toml::from_str::<toml::Value>(&raw)
+    {
+        return Theme::from_toml_value(&value);
+    }
+    if let Ok(value) = toml::from_str::<toml::Value>(default_theme_contents()) {
+        return Theme::from_toml_value(&value);
+    }
+    Theme::hardcoded_defaults()
 }
 
-fn theme_vars(value: &toml::Value) -> HashMap<String, String> {
-    let mut vars = HashMap::new();
-    if let Some(tbl) = value.get("vars").and_then(|v| v.as_table()) {
-        for (k, v) in tbl {
-            if let Some(s) = v.as_str() {
-                vars.insert(k.clone(), s.to_string());
-            }
-        }
+fn ensure_local_defaults_files() -> io::Result<()> {
+    let dir = PathBuf::from("defaults");
+    fs::create_dir_all(&dir)?;
+    let layout = dir.join("layout.toml");
+    if !layout.exists() {
+        fs::write(&layout, default_config_contents())?;
     }
-    vars
-}
-
-fn theme_color(value: &toml::Value, vars: &HashMap<String, String>, path: &str, fallback: &str) -> String {
-    let Some(raw) = theme_lookup(value, path).and_then(|v| v.as_str()) else {
-        return fallback.to_string();
-    };
-    if let Some(var_name) = raw.strip_prefix('$') {
-        if let Some(v) = vars.get(var_name) {
-            return v.clone();
-        }
-        eprintln!("warning: missing theme var ${var_name}, using fallback {fallback}");
-        return fallback.to_string();
+    let theme = dir.join("theme.toml");
+    if !theme.exists() {
+        fs::write(&theme, default_theme_contents())?;
     }
-    raw.to_string()
-}
-
-fn theme_lookup<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
-    let mut cur = value;
-    for seg in path.split('.') {
-        cur = cur.get(seg)?;
-    }
-    Some(cur)
+    Ok(())
 }
 
 fn write_default_config(path: &Path) -> io::Result<()> {
@@ -2753,6 +3048,30 @@ fn init_config_file() -> io::Result<String> {
     }
     write_default_config(&path)?;
     Ok("Config created at ~/.config/dirt/dirt.toml".to_string())
+}
+
+fn init_layout_file() -> io::Result<String> {
+    let path = layout_config_path();
+    if path.exists() {
+        return Ok(format!("Layout already exists at {}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, default_config_contents())?;
+    Ok(format!("Layout created at {}", path.display()))
+}
+
+fn init_theme_file() -> io::Result<String> {
+    let path = theme_config_path();
+    if path.exists() {
+        return Ok(format!("Theme already exists at {}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, default_theme_contents())?;
+    Ok(format!("Theme created at {}", path.display()))
 }
 
 fn init_keymap_file() -> io::Result<String> {
@@ -2810,75 +3129,7 @@ fn load_keymap_config() -> KeymapConfig {
 }
 
 fn default_config_contents() -> &'static str {
-    r#"# DIRT config
-# Location: ~/.config/dirt/dirt.toml
-# Notes:
-# - Theme is profile-only (`[[profiles]].theme`)
-# - Paths support `~` and `~/...`
-# - This file is intended to be user-edited
-
-[sidebar]
-# Sidebar bookmarks shown in the left panel
-bookmarks = [{ name = "home", path = "~" }]
-
-[ui]
-# Top bar height in terminal rows
-top_bar_height = 3
-
-[ui.panels]
-# Toggle panel visibility
-sidebar = true
-preview = true
-keymap_bar = true
-search_bar = true
-status_bar = true
-columns = true
-
-[ui.panel_ratios]
-# Width ratios (relative weights)
-# Example: 1/4/2 means sidebar=1 part, dir=4 parts, preview=2 parts
-sidebar = 1
-dir = 4
-preview = 2
-
-[navigation]
-# Base navigation defaults used unless profile overrides
-start_dir = "~/"
-show_hidden = false
-sort = "name"
-max_columns = 4
-
-[features]
-# Feature flags (string identifiers)
-enabled = ["preview", "git_status"]
-
-[search]
-# Search behavior (`/` local, Ctrl+F global)
-ignored_dirs = [".git", "node_modules"]
-max_depth = 6
-
-[[profiles]]
-# Profile shown in status bar and switchable in-app
-name = "default"
-theme = "dark"
-start_dir = "~/"
-show_hidden = false
-features = ["preview", "git_status"]
-
-[[profiles]]
-name = "dev"
-theme = "dark"
-start_dir = "~/"
-show_hidden = true
-features = ["preview", "git_status", "thumbnails"]
-
-[[profiles]]
-name = "clean"
-theme = "dark"
-start_dir = "~/"
-show_hidden = false
-features = ["preview"]
-"#
+    include_str!("../defaults/layout.toml")
 }
 
 fn default_keymap_contents() -> &'static str {
@@ -2912,6 +3163,10 @@ quit         = "q"
 next_profile = "p"
 prev_profile = "P"
 "#
+}
+
+fn default_theme_contents() -> &'static str {
+    include_str!("../defaults/theme.toml")
 }
 
 fn normalize_start_dir(input: &str) -> PathBuf {
