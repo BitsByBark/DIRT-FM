@@ -109,6 +109,8 @@ struct NavigationConfig {
     sort: String,
     #[serde(default = "default_max_columns")]
     max_columns: usize,
+    #[serde(default)]
+    sudo_mode: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -347,6 +349,9 @@ struct App {
     user_name: String,
     device_name: String,
     image_protocol: Option<ImageProtocol>,
+    sudo_mode: bool,
+    sudo_password_prompt: bool,
+    sudo_password_input: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,7 +454,7 @@ impl App {
             None
         };
         let current_dir = effective.start_dir.clone();
-        let columns = build_columns_from_path(&current_dir, &effective);
+        let columns = build_columns_from_path(&current_dir, &effective, false, None);
         Ok(Self {
             config,
             active_profile,
@@ -481,6 +486,9 @@ impl App {
             user_name,
             device_name,
             image_protocol,
+            sudo_mode: false,
+            sudo_password_prompt: false,
+            sudo_password_input: String::new(),
         })
     }
 
@@ -491,6 +499,10 @@ impl App {
         }
         if self.input_mode != InputMode::None {
             self.handle_input_mode(key);
+            return;
+        }
+        if self.sudo_password_prompt {
+            self.handle_sudo_password_input(key);
             return;
         }
         if self.search_mode != SearchMode::None {
@@ -660,7 +672,10 @@ impl App {
     }
 
     fn draw_top_bar(&self, frame: &mut Frame, area: Rect) {
-        let mode_color = if self.awaiting_bookmark_slot {
+        let sudo_color = parse_color(&self.effective.theme_colors.vars.sudo_mode);
+        let mode_color = if self.sudo_mode {
+            sudo_color
+        } else if self.awaiting_bookmark_slot {
             parse_color(&self.effective.theme_colors.vars.bookmark_mode)
         } else if self.search_mode != SearchMode::None {
             parse_color(&self.effective.theme_colors.vars.search_mode)
@@ -670,7 +685,7 @@ impl App {
             parse_color(&self.effective.theme_colors.vars.defult_panel_label)
         };
         let top_bar_fg = mode_color;
-        let top_bar_border = if self.awaiting_bookmark_slot || self.search_mode != SearchMode::None || self.selection_mode {
+        let top_bar_border = if self.sudo_mode || self.awaiting_bookmark_slot || self.search_mode != SearchMode::None || self.selection_mode {
             mode_color
         } else {
             parse_color(&self.effective.theme_colors.vars.defult_panel_border)
@@ -689,6 +704,14 @@ impl App {
                 ("DIRT::".to_string(), "search".to_string())
             } else if self.selection_mode {
                 ("DIRT::".to_string(), "selection".to_string())
+            } else if self.sudo_mode {
+                let profile_name = self
+                    .config
+                    .profiles
+                    .get(self.active_profile)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("default");
+                ("DIRT // ".to_string(), format!("{profile_name} // SUDO"))
             } else {
                 let profile_name = self
                     .config
@@ -724,10 +747,14 @@ impl App {
         }
 
         if self.effective.panels.columns {
-            let search_label = match self.search_mode {
+            let search_label = if self.sudo_password_prompt {
+                format!("[sudo] password: {}", "*".repeat(self.sudo_password_input.len()))
+            } else {
+                match self.search_mode {
                 SearchMode::None => "/ to search".to_string(),
                 SearchMode::Local => format!("/ {}", self.search_query),
                 SearchMode::Global => format!("Ctrl+F {}", self.search_query),
+                }
             };
             let label = if self.input_mode == InputMode::None {
                 search_label
@@ -780,7 +807,9 @@ impl App {
         } else {
             panel_fg
         };
-        let sidebar_border = if self.awaiting_bookmark_slot {
+        let sidebar_border = if self.sudo_mode {
+            parse_color(&self.effective.theme_colors.vars.sudo_mode)
+        } else if self.awaiting_bookmark_slot {
             parse_color(&self.effective.theme_colors.vars.bookmark_mode)
         } else {
             parse_color(&self.effective.theme_colors.vars.defult_panel_border)
@@ -889,7 +918,11 @@ impl App {
             .borders(Borders::ALL)
             .style(
                 Style::default()
-                    .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
+                    .fg(if self.sudo_mode {
+                        parse_color(&self.effective.theme_colors.vars.sudo_mode)
+                    } else {
+                        parse_color(&self.effective.theme_colors.vars.defult_panel_border)
+                    }),
             );
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
@@ -932,8 +965,21 @@ impl App {
                     );
                     frame.render_widget(p, chunks[idx]);
                 } else if let Some(selected_dir) = self.selected_dir_path() {
-                    let preview_col = DirColumn::from_path(selected_dir.to_path_buf(), &self.effective);
-                    if preview_col.entries.is_empty() {
+                    let preview_col = DirColumn::from_path(
+                        selected_dir.to_path_buf(),
+                        &self.effective,
+                        self.sudo_mode,
+                        if self.sudo_password_input.is_empty() { None } else { Some(self.sudo_password_input.as_str()) },
+                    );
+                    if preview_col.permission_denied {
+                        let block = Block::default().borders(Borders::ALL).style(
+                            Style::default()
+                                .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
+                        );
+                        let inner = block.inner(chunks[idx]);
+                        frame.render_widget(block, chunks[idx]);
+                        render_no_perms_mascot(frame, inner, &self.effective.theme_colors, &preview_col.path, self.sudo_mode);
+                    } else if preview_col.entries.is_empty() {
                         let block = Block::default().borders(Borders::ALL).style(
                             Style::default()
                                 .fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
@@ -988,6 +1034,19 @@ impl App {
                 frame.render_widget(p, chunks[idx]);
                 continue;
             };
+            if col.permission_denied {
+                let title = format!("/{}", path_last_segment(&col.path));
+                let block = Block::default()
+                    .title(Line::from(title).style(Style::default().fg(parse_color(
+                        &self.effective.theme_colors.vars.defult_panel_label,
+                    ))))
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)));
+                let inner = block.inner(chunks[idx]);
+                frame.render_widget(block, chunks[idx]);
+                render_no_perms_mascot(frame, inner, &self.effective.theme_colors, &col.path, self.sudo_mode);
+                continue;
+            }
 
             let is_focused_column = idx == active_render_idx;
             let col_theme = self.column_theme_for(idx);
@@ -1008,8 +1067,10 @@ impl App {
                 (0..col.entries.len()).collect::<Vec<_>>()
             };
             let mode_highlight_active =
-                self.awaiting_bookmark_slot || self.selection_mode || self.search_mode != SearchMode::None;
-            let mode_highlight_color = if self.awaiting_bookmark_slot {
+                self.sudo_mode || self.awaiting_bookmark_slot || self.selection_mode || self.search_mode != SearchMode::None;
+            let mode_highlight_color = if self.sudo_mode {
+                &self.effective.theme_colors.vars.sudo_mode
+            } else if self.awaiting_bookmark_slot {
                 &self.effective.theme_colors.vars.bookmark_mode
             } else if self.search_mode != SearchMode::None {
                 &self.effective.theme_colors.vars.search_mode
@@ -1280,7 +1341,13 @@ impl App {
             return;
         };
         let path = selected.path.clone();
-        self.columns.push(DirColumn::from_path(path.clone(), &self.effective));
+        self.columns.push(DirColumn::from_path(
+            path.clone(),
+            &self.effective,
+            self.sudo_mode,
+            if self.sudo_password_input.is_empty() { None } else { Some(self.sudo_password_input.as_str()) },
+        ));
+        self.sudo_password_prompt = self.sudo_mode && self.columns.iter().any(|c| c.sudo_password_required);
         self.current_dir = path;
         self.track_recent_dir();
         self.clear_simple_selection();
@@ -1356,7 +1423,8 @@ impl App {
             return;
         }
         self.current_dir = target.clone();
-        self.columns = build_columns_from_path(&target, &self.effective);
+        self.columns = build_columns_from_path(&target, &self.effective, self.sudo_mode, if self.sudo_password_input.is_empty() { None } else { Some(self.sudo_password_input.as_str()) });
+        self.sudo_password_prompt = self.sudo_mode && self.columns.iter().any(|c| c.sudo_password_required);
         self.track_recent_dir();
         self.search_mode = SearchMode::None;
         self.search_query.clear();
@@ -1386,7 +1454,8 @@ impl App {
     }
 
     fn reinitialize_columns(&mut self) {
-        self.columns = build_columns_from_path(&self.effective.start_dir, &self.effective);
+        self.columns = build_columns_from_path(&self.effective.start_dir, &self.effective, self.sudo_mode, if self.sudo_password_input.is_empty() { None } else { Some(self.sudo_password_input.as_str()) });
+        self.sudo_password_prompt = self.sudo_mode && self.columns.iter().any(|c| c.sudo_password_required);
         self.current_dir = self.effective.start_dir.clone();
         self.track_recent_dir();
     }
@@ -1397,20 +1466,25 @@ impl App {
         } else {
             self.effective.start_dir.clone()
         };
-        self.columns = build_columns_from_path(&target, &self.effective);
+        self.columns = build_columns_from_path(&target, &self.effective, self.sudo_mode, if self.sudo_password_input.is_empty() { None } else { Some(self.sudo_password_input.as_str()) });
+        self.sudo_password_prompt = self.sudo_mode && self.columns.iter().any(|c| c.sudo_password_required);
         self.current_dir = target;
         self.track_recent_dir();
     }
 
     fn draw_details_panel(&self, frame: &mut Frame, area: Rect) {
-        let details_color = if self.search_mode != SearchMode::None {
+        let details_color = if self.sudo_mode {
+            parse_color(&self.effective.theme_colors.vars.sudo_mode)
+        } else if self.search_mode != SearchMode::None {
             parse_color(&self.effective.theme_colors.vars.search_mode)
         } else if self.selection_mode {
             parse_color(&self.effective.theme_colors.vars.selection_mode)
         } else {
             parse_color(&self.effective.theme_colors.vars.defult_panel_border)
         };
-        let details_title_color = if self.search_mode != SearchMode::None {
+        let details_title_color = if self.sudo_mode {
+            parse_color(&self.effective.theme_colors.vars.sudo_mode)
+        } else if self.search_mode != SearchMode::None {
             parse_color(&self.effective.theme_colors.vars.search_mode)
         } else if self.selection_mode {
             parse_color(&self.effective.theme_colors.vars.selection_mode)
@@ -1418,7 +1492,19 @@ impl App {
             parse_color(&self.effective.theme_colors.vars.defult_panel_label)
         };
         if let Some(path) = self.selected_dir_path() {
-            if read_dir_entries(path, &self.effective).is_empty() {
+            let read = read_dir_entries(path, &self.effective, self.sudo_mode, if self.sudo_password_input.is_empty() { None } else { Some(self.sudo_password_input.as_str()) });
+            if read.permission_denied {
+                let block = Block::default()
+                    .title(Line::from("Details").style(Style::default().fg(details_title_color)))
+                    .borders(Borders::ALL)
+                    .padding(Padding::horizontal(1))
+                    .style(Style::default().fg(details_color));
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                render_no_perms_mascot(frame, inner, &self.effective.theme_colors, path, self.sudo_mode);
+                return;
+            }
+            if read.entries.is_empty() {
                 if let Some(protocol) = self.image_protocol {
                     let _ = preview::clear_last_image(protocol);
                 }
@@ -1564,6 +1650,7 @@ impl App {
             .map(|p| p.name.as_str())
             .unwrap_or("default");
         let panel_fg = parse_color(&self.effective.theme_colors.vars.defult_panel_label);
+        let sudo_color = parse_color(&self.effective.theme_colors.vars.sudo_mode);
         let sep = Span::styled(" · ", Style::default().fg(panel_fg));
         let mut spans = vec![
             Span::styled(
@@ -1599,7 +1686,7 @@ impl App {
                 format!("profile: {}", profile_name),
                 Style::default().fg(panel_fg),
             ),
-            sep,
+            sep.clone(),
             Span::styled(
                 if self.status_message.is_empty() {
                     "ready".to_string()
@@ -1609,10 +1696,18 @@ impl App {
                 Style::default().fg(panel_fg),
             ),
         ];
+        if self.sudo_mode {
+            spans.push(sep.clone());
+            spans.push(Span::styled("SUDO", Style::default().fg(sudo_color).add_modifier(Modifier::BOLD)));
+        }
         frame.render_widget(
             Paragraph::new(Line::from(std::mem::take(&mut spans))).block(
                 Block::default().borders(Borders::TOP).border_style(
-                    Style::default().fg(parse_color(&self.effective.theme_colors.vars.defult_panel_border)),
+                    Style::default().fg(if self.sudo_mode {
+                        sudo_color
+                    } else {
+                        parse_color(&self.effective.theme_colors.vars.defult_panel_border)
+                    }),
                 ),
             ),
             area,
@@ -1950,7 +2045,9 @@ impl App {
                     self.open_global_selected();
                 } else {
                     let cmd = self.search_query.trim();
-                    if cmd == "config init" || cmd == "/config init" {
+                    if cmd == "sudo" || cmd == "/sudo" {
+                        self.toggle_sudo_mode();
+                    } else if cmd == "config init" || cmd == "/config init" {
                         self.status_message = match init_config_file() {
                             Ok(msg) => msg,
                             Err(e) => format!("config init failed: {e}"),
@@ -1988,6 +2085,9 @@ impl App {
     fn on_search_query_changed(&mut self) {
         match self.search_mode {
             SearchMode::Local => {
+                if self.search_query.trim() == "/sudo" || self.search_query.trim() == "sudo" {
+                    return;
+                }
                 let filtered = self
                     .columns
                     .last()
@@ -2026,12 +2126,69 @@ impl App {
                 .unwrap_or_else(|| self.current_dir.clone())
         };
         self.current_dir = target_dir.clone();
-        self.columns = build_columns_from_path(&target_dir, &self.effective);
+        self.columns = build_columns_from_path(&target_dir, &self.effective, self.sudo_mode, if self.sudo_password_input.is_empty() { None } else { Some(self.sudo_password_input.as_str()) });
+        self.sudo_password_prompt = self.sudo_mode && self.columns.iter().any(|c| c.sudo_password_required);
         self.track_recent_dir();
         self.search_mode = SearchMode::None;
         self.search_query.clear();
         self.global_results.clear();
         self.global_selected = 0;
+    }
+
+    fn toggle_sudo_mode(&mut self) {
+        self.sudo_mode = !self.sudo_mode;
+        self.sudo_password_prompt = false;
+        self.sudo_password_input.clear();
+        self.status_message = if self.sudo_mode {
+            "sudo mode enabled".to_string()
+        } else {
+            "sudo mode disabled".to_string()
+        };
+        self.refresh_all_columns();
+    }
+
+    fn handle_sudo_password_input(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.sudo_password_prompt = false;
+                self.sudo_password_input.clear();
+                self.status_message = "sudo mode disabled".to_string();
+                self.sudo_mode = false;
+                self.refresh_all_columns();
+            }
+            KeyCode::Backspace => {
+                self.sudo_password_input.pop();
+            }
+            KeyCode::Enter => {
+                self.sudo_password_prompt = false;
+                self.refresh_all_columns();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.sudo_password_input.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_all_columns(&mut self) {
+        let mut any_password_required = false;
+        for col in &mut self.columns {
+            let read = read_dir_entries(
+                &col.path,
+                &self.effective,
+                self.sudo_mode,
+                if self.sudo_password_input.is_empty() {
+                    None
+                } else {
+                    Some(self.sudo_password_input.as_str())
+                },
+            );
+            col.entries = read.entries;
+            col.permission_denied = read.permission_denied;
+            col.sudo_password_required = read.sudo_password_required;
+            any_password_required |= read.sudo_password_required;
+        }
+        self.sudo_password_prompt = self.sudo_mode && any_password_required;
     }
 
     fn handle_input_mode(&mut self, key: crossterm::event::KeyEvent) {
@@ -2279,7 +2436,10 @@ impl App {
 
     fn refresh_active_column(&mut self) {
         if let Some(col) = self.columns.last_mut() {
-            col.entries = read_dir_entries(&col.path, &self.effective);
+            let read = read_dir_entries(&col.path, &self.effective, self.sudo_mode, if self.sudo_password_input.is_empty() { None } else { Some(self.sudo_password_input.as_str()) });
+            col.entries = read.entries;
+            col.permission_denied = read.permission_denied;
+            col.sudo_password_required = read.sudo_password_required;
             if col.entries.is_empty() {
                 col.selected = 0;
             } else if col.selected >= col.entries.len() {
@@ -2529,15 +2689,19 @@ struct DirColumn {
     path: PathBuf,
     entries: Vec<DirEntry>,
     selected: usize,
+    permission_denied: bool,
+    sudo_password_required: bool,
 }
 
 impl DirColumn {
-    fn from_path(path: PathBuf, settings: &EffectiveSettings) -> Self {
-        let entries = read_dir_entries(&path, settings);
+    fn from_path(path: PathBuf, settings: &EffectiveSettings, sudo_mode: bool, sudo_password: Option<&str>) -> Self {
+        let read = read_dir_entries(&path, settings, sudo_mode, sudo_password);
         Self {
             path,
-            entries,
+            entries: read.entries,
             selected: 0,
+            permission_denied: read.permission_denied,
+            sudo_password_required: read.sudo_password_required,
         }
     }
 }
@@ -2798,7 +2962,12 @@ fn path_last_segment(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn build_columns_from_path(path: &Path, settings: &EffectiveSettings) -> Vec<DirColumn> {
+fn build_columns_from_path(
+    path: &Path,
+    settings: &EffectiveSettings,
+    sudo_mode: bool,
+    sudo_password: Option<&str>,
+) -> Vec<DirColumn> {
     let target_dir = if path.is_dir() {
         path.to_path_buf()
     } else {
@@ -2823,7 +2992,7 @@ fn build_columns_from_path(path: &Path, settings: &EffectiveSettings) -> Vec<Dir
 
     let mut cols = chain
         .iter()
-        .map(|p| DirColumn::from_path(p.clone(), settings))
+        .map(|p| DirColumn::from_path(p.clone(), settings, sudo_mode, sudo_password))
         .collect::<Vec<_>>();
 
     for idx in 0..cols.len().saturating_sub(1) {
@@ -2834,15 +3003,61 @@ fn build_columns_from_path(path: &Path, settings: &EffectiveSettings) -> Vec<Dir
     }
 
     if cols.is_empty() {
-        vec![DirColumn::from_path(target_dir, settings)]
+        vec![DirColumn::from_path(target_dir, settings, sudo_mode, sudo_password)]
     } else {
         cols
     }
 }
 
-fn read_dir_entries(path: &Path, settings: &EffectiveSettings) -> Vec<DirEntry> {
-    let Ok(read_dir) = fs::read_dir(path) else {
-        return Vec::new();
+#[derive(Debug, Clone)]
+struct DirReadOutcome {
+    entries: Vec<DirEntry>,
+    permission_denied: bool,
+    sudo_password_required: bool,
+}
+
+fn read_dir_entries(
+    path: &Path,
+    settings: &EffectiveSettings,
+    sudo_mode: bool,
+    sudo_password: Option<&str>,
+) -> DirReadOutcome {
+    if sudo_mode {
+        match read_dir_entries_sudo(path, settings, sudo_password) {
+            Ok(entries) => {
+                return DirReadOutcome {
+                    entries,
+                    permission_denied: false,
+                    sudo_password_required: false,
+                };
+            }
+            Err(SudoReadError::PasswordRequired) => {
+                return DirReadOutcome {
+                    entries: Vec::new(),
+                    permission_denied: true,
+                    sudo_password_required: true,
+                };
+            }
+            Err(SudoReadError::PermissionDenied) => {
+                return DirReadOutcome {
+                    entries: Vec::new(),
+                    permission_denied: true,
+                    sudo_password_required: false,
+                };
+            }
+            Err(SudoReadError::Other) => {}
+        }
+    }
+
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            return DirReadOutcome {
+                entries: Vec::new(),
+                permission_denied: e.kind() == io::ErrorKind::PermissionDenied,
+                sudo_password_required: false,
+            };
+        }
     };
     let mut entries = Vec::new();
     for dir_entry in read_dir.flatten() {
@@ -2879,7 +3094,11 @@ fn read_dir_entries(path: &Path, settings: &EffectiveSettings) -> Vec<DirEntry> 
         });
     }
     entries.sort_by(|a, b| sort_entries(a, b, settings.sort.as_str()));
-    entries
+    DirReadOutcome {
+        entries,
+        permission_denied: false,
+        sudo_password_required: false,
+    }
 }
 
 fn sort_entries(a: &DirEntry, b: &DirEntry, sort_mode: &str) -> Ordering {
@@ -2907,6 +3126,85 @@ fn sort_entries(a: &DirEntry, b: &DirEntry, sort_mode: &str) -> Ordering {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     }
+}
+
+enum SudoReadError {
+    PasswordRequired,
+    PermissionDenied,
+    Other,
+}
+
+fn read_dir_entries_sudo(
+    path: &Path,
+    settings: &EffectiveSettings,
+    sudo_password: Option<&str>,
+) -> Result<Vec<DirEntry>, SudoReadError> {
+    let mut cmd = Command::new("sudo");
+    cmd.arg("-S")
+        .arg("-p")
+        .arg("")
+        .arg("ls")
+        .arg("-la")
+        .arg("--group-directories-first")
+        .arg(path);
+    let output = if let Some(pw) = sudo_password {
+        use std::process::Stdio;
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|_| SudoReadError::Other)?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = std::io::Write::write_all(&mut stdin, format!("{pw}\n").as_bytes());
+        }
+        child.wait_with_output().map_err(|_| SudoReadError::Other)?
+    } else {
+        cmd.arg("-n").output().map_err(|_| SudoReadError::Other)?
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if stderr.contains("password") {
+            return Err(SudoReadError::PasswordRequired);
+        }
+        if stderr.contains("permission denied") {
+            return Err(SudoReadError::PermissionDenied);
+        }
+        return Err(SudoReadError::Other);
+    }
+    let out = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    for line in out.lines() {
+        if line.starts_with("total ") || line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let perms = match parts.next() {
+            Some(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 9 {
+            continue;
+        }
+        let name = cols[8..].join(" ");
+        if name == "." || name == ".." {
+            continue;
+        }
+        if !settings.show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let entry_path = path.join(&name);
+        let is_dir = perms.starts_with('d');
+        let is_symlink = perms.starts_with('l');
+        let is_executable = perms.chars().nth(3) == Some('x')
+            || perms.chars().nth(6) == Some('x')
+            || perms.chars().nth(9) == Some('x');
+        entries.push(DirEntry {
+            name,
+            path: entry_path,
+            is_dir,
+            is_symlink,
+            is_executable,
+        });
+    }
+    entries.sort_by(|a, b| sort_entries(a, b, settings.sort.as_str()));
+    Ok(entries)
 }
 
 fn extension_of(name: &str) -> String {
@@ -3097,6 +3395,51 @@ fn image_preview_panel_height(area: Rect, path: &Path) -> u16 {
     desired_inner_height
         .saturating_add(2)
         .clamp(min_panel_height, max_panel_height)
+}
+
+fn render_no_perms_mascot(frame: &mut Frame, area: Rect, theme: &Theme, path: &Path, sudo_mode: bool) {
+    let body_color = if sudo_mode {
+        parse_color(&theme.vars.sudo_mode)
+    } else {
+        parse_color(&theme.mascot.no_perms_body)
+    };
+    let text_color = parse_color(&theme.mascot.text);
+    let shadow_color = parse_color(&theme.mascot.shadow);
+    let secondary = parse_color(&theme.vars.secondary_fg);
+    let mascot = [
+        "  ██████",
+        " █████████████████",
+        " ██// NO █████████▒",
+        " ██PERMSSIONS ████▒",
+        " ██/SUDO █████████▒",
+        " █████████████████▒",
+        "  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒",
+    ];
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let top_pad = area.height.saturating_sub((mascot.len() + 2) as u16) / 2;
+    for _ in 0..top_pad {
+        lines.push(Line::from(""));
+    }
+    for raw in mascot {
+        let spans = raw
+            .chars()
+            .map(|c| {
+                let style = match c {
+                    '█' => Style::default().fg(body_color),
+                    '▒' => Style::default().fg(shadow_color),
+                    '/' | 'N' | 'O' | 'P' | 'E' | 'R' | 'M' | 'S' | 'I' | 'U' | 'D' => {
+                        Style::default().fg(text_color)
+                    }
+                    _ => Style::default().fg(body_color),
+                };
+                Span::styled(c.to_string(), style)
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(display_home_relative(path), Style::default().fg(secondary))));
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

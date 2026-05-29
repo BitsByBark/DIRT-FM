@@ -40,12 +40,14 @@ pub struct VarsTheme {
     pub search_mode: String,
     pub bookmark_mode: String,
     pub mascot_empty_body: String,
+    pub sudo_mode: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct MascotTheme {
     pub empty_dir_body: String,
     pub incompatible_body: String,
+    pub no_perms_body: String,
     pub text: String,
     pub shadow: String,
 }
@@ -183,10 +185,12 @@ impl Theme {
                 search_mode: get("vars.search_mode", "#4CB2F6"),
                 bookmark_mode: get("vars.bookmark_mode", "#EE9C9C"),
                 mascot_empty_body: get("vars.mascot_empty_body", "#F64646"),
+                sudo_mode: get("vars.sudo_mode", "#F64646"),
             },
             mascot: MascotTheme {
                 empty_dir_body: get("mascot.empty_dir_body", &get("vars.mascot_empty_body", "#F64646")),
                 incompatible_body: get("mascot.incompatible_body", &get("vars.mascot_empty_body", "#F64646")),
+                no_perms_body: get("mascot.no_perms_body", &get("vars.sudo_mode", "#F64646")),
                 text: get("mascot.text", "#FFFFFF"),
                 shadow: get("mascot.shadow", "#FFFFFF"),
             },
