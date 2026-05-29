@@ -39,6 +39,10 @@ enabled = ["preview", "git_status"]
 ignored_dirs = [".git", "node_modules"]
 max_depth = 6
 
+[preview]
+images = true
+max_image_size_mb = 20
+
 [[profiles]]
 name = "default"
 theme = "dark"

@@ -45,6 +45,7 @@ pub struct VarsTheme {
 #[derive(Debug, Clone)]
 pub struct MascotTheme {
     pub empty_dir_body: String,
+    pub incompatible_body: String,
     pub text: String,
     pub shadow: String,
 }
@@ -185,6 +186,7 @@ impl Theme {
             },
             mascot: MascotTheme {
                 empty_dir_body: get("mascot.empty_dir_body", &get("vars.mascot_empty_body", "#F64646")),
+                incompatible_body: get("mascot.incompatible_body", &get("vars.mascot_empty_body", "#F64646")),
                 text: get("mascot.text", "#FFFFFF"),
                 shadow: get("mascot.shadow", "#FFFFFF"),
             },

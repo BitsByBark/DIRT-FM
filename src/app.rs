@@ -24,6 +24,7 @@ use ratatui::layout::Alignment;
 use serde::{Deserialize, Serialize};
 use crate::theme::{ColumnTheme, Theme};
 use crate::mascot::render_empty_dir_mascot;
+use crate::ui::preview::{self, ImageProtocol, PreviewImageConfig};
 
 pub fn run_app() -> Result<()> {
     color_eyre::install()?;
@@ -70,6 +71,8 @@ struct AppConfig {
     search: SearchSettings,
     #[serde(default)]
     miller: MillerConfig,
+    #[serde(default)]
+    preview: PreviewConfig,
     #[serde(default)]
     profiles: Vec<Profile>,
     #[serde(skip)]
@@ -216,6 +219,24 @@ struct EffectiveSettings {
     column_ratios: Vec<u16>,
     search: SearchSettings,
     panels: Panels,
+    preview: PreviewConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PreviewConfig {
+    #[serde(default = "default_true")]
+    images: bool,
+    #[serde(default = "default_max_image_size_mb")]
+    max_image_size_mb: u64,
+}
+
+impl Default for PreviewConfig {
+    fn default() -> Self {
+        Self {
+            images: true,
+            max_image_size_mb: default_max_image_size_mb(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -290,6 +311,7 @@ impl AppConfig {
             column_ratios,
             search: self.search.clone(),
             panels: self.ui.panels.clone(),
+            preview: self.preview.clone(),
         }
     }
 }
@@ -324,6 +346,7 @@ struct App {
     awaiting_bookmark_slot: bool,
     user_name: String,
     device_name: String,
+    image_protocol: Option<ImageProtocol>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +432,7 @@ struct KeymapApp {
 enum PreviewData {
     Empty,
     Details(Vec<Line<'static>>),
+    UnsupportedImageMascot { filename: String, size: String },
 }
 
 impl App {
@@ -419,6 +443,11 @@ impl App {
         let recents = load_recents()?;
         let drives = discover_drives();
         let (user_name, device_name) = user_device_names();
+        let image_protocol = if effective.preview.images {
+            preview::detect_image_protocol()
+        } else {
+            None
+        };
         let current_dir = effective.start_dir.clone();
         let columns = build_columns_from_path(&current_dir, &effective);
         Ok(Self {
@@ -451,6 +480,7 @@ impl App {
             awaiting_bookmark_slot: false,
             user_name,
             device_name,
+            image_protocol,
         })
     }
 
@@ -1389,6 +1419,9 @@ impl App {
         };
         if let Some(path) = self.selected_dir_path() {
             if read_dir_entries(path, &self.effective).is_empty() {
+                if let Some(protocol) = self.image_protocol {
+                    let _ = preview::clear_last_image(protocol);
+                }
                 let block = Block::default()
                     .title(Line::from("Details").style(Style::default().fg(details_title_color)))
                     .borders(Borders::ALL)
@@ -1403,9 +1436,69 @@ impl App {
                 return;
             }
         }
+
+        if let Some(path) = self.selected_entry_path()
+            && preview::is_supported_image(&path)
+            && self.effective.preview.images
+        {
+            let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let max_bytes = self.effective.preview.max_image_size_mb * 1024 * 1024;
+            let metadata = image_metadata_lines(&path);
+            if file_size > max_bytes {
+                if let Some(protocol) = self.image_protocol {
+                    let _ = preview::clear_last_image(protocol);
+                }
+                self.render_details_lines(frame, area, metadata, details_title_color, details_color);
+                return;
+            }
+
+            let preview_height = image_preview_panel_height(area, &path);
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(preview_height),
+                    Constraint::Min(5),
+                ])
+                .split(area);
+
+            if let Some(protocol) = self.image_protocol {
+                self.draw_image_preview(frame, split[0], &path, protocol, details_title_color, details_color);
+                self.render_details_lines(frame, split[1], metadata, details_title_color, details_color);
+                return;
+            }
+
+            let size = format_size(file_size);
+            preview::render_unsupported_mascot(
+                frame,
+                split[0],
+                &self.effective.theme_colors,
+                &path_last_segment(&path),
+                &size,
+            );
+            if let Some(protocol) = self.image_protocol {
+                let _ = preview::clear_last_image(protocol);
+            }
+            self.render_details_lines(frame, split[1], metadata, details_title_color, details_color);
+            return;
+        }
+
+        if let Some(protocol) = self.image_protocol {
+            let _ = preview::clear_last_image(protocol);
+        }
+
         let details_text = match self.current_preview() {
             PreviewData::Empty => vec![Line::from("No selection")],
             PreviewData::Details(content) => content,
+            PreviewData::UnsupportedImageMascot { filename, size } => {
+                preview::render_unsupported_mascot(
+                    frame,
+                    area,
+                    &self.effective.theme_colors,
+                    &filename,
+                    &size,
+                );
+                return;
+            }
         };
         let p = Paragraph::new(details_text)
             .style(Style::default().fg(parse_color(&self.effective.theme_colors.vars.defult_panel_label)))
@@ -1420,6 +1513,47 @@ impl App {
                     ),
             );
         frame.render_widget(p, area);
+    }
+
+    fn draw_image_preview(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        path: &Path,
+        protocol: ImageProtocol,
+        title_color: Color,
+        border_color: Color,
+    ) {
+        let block = Block::default()
+            .title(Line::from("Preview").style(Style::default().fg(title_color)))
+            .borders(Borders::ALL)
+            .style(Style::default().fg(border_color));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let _ = preview::render_image(path, inner, protocol);
+    }
+
+    fn render_details_lines(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        lines: Vec<Line<'static>>,
+        title_color: Color,
+        border_color: Color,
+    ) {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().fg(parse_color(&self.effective.theme_colors.vars.secondary_fg)))
+                .block(
+                    Block::default()
+                        .title(Line::from("Details").style(Style::default().fg(title_color)))
+                        .borders(Borders::ALL)
+                        .padding(Padding::horizontal(1))
+                        .style(Style::default().fg(border_color)),
+                ),
+            area,
+        );
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
@@ -1651,6 +1785,8 @@ impl App {
                     &self.effective.theme_colors,
                     self.selection_mode,
                     self.search_mode != SearchMode::None,
+                    self.image_preview_config(),
+                    self.image_protocol,
                 ))
                 .unwrap_or(PreviewData::Empty);
         }
@@ -1662,7 +1798,16 @@ impl App {
             &self.effective.theme_colors,
             self.selection_mode,
             self.search_mode != SearchMode::None,
+            self.image_preview_config(),
+            self.image_protocol,
         )
+    }
+
+    fn image_preview_config(&self) -> PreviewImageConfig {
+        PreviewImageConfig {
+            enabled: self.effective.preview.images,
+            max_image_size_mb: self.effective.preview.max_image_size_mb,
+        }
     }
 
     fn git_status_text(&self) -> String {
@@ -2605,6 +2750,10 @@ fn default_search_max_depth() -> usize {
     6
 }
 
+fn default_max_image_size_mb() -> u64 {
+    20
+}
+
 pub(crate) fn parse_color(name: &str) -> Color {
     if let Some(hex) = name.strip_prefix('#')
         && hex.len() == 6
@@ -2766,7 +2915,14 @@ fn extension_of(name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn preview_for_path(path: &Path, colors: &Theme, selection_mode: bool, search_mode: bool) -> PreviewData {
+fn preview_for_path(
+    path: &Path,
+    colors: &Theme,
+    selection_mode: bool,
+    search_mode: bool,
+    image_cfg: PreviewImageConfig,
+    image_protocol: Option<ImageProtocol>,
+) -> PreviewData {
     let text_color = if search_mode {
         parse_color(&colors.vars.search_mode)
     } else if selection_mode {
@@ -2790,6 +2946,21 @@ fn preview_for_path(path: &Path, colors: &Theme, selection_mode: bool, search_mo
             Span::styled("false", Style::default().fg(parse_color(&colors.vars.bool_no)))
         }
     };
+    if preview::is_supported_image(path) {
+        let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let max_bytes = image_cfg.max_image_size_mb * 1024 * 1024;
+        if file_size > max_bytes {
+            return PreviewData::Details(image_metadata_lines(path));
+        }
+        if image_cfg.enabled && image_protocol.is_none() {
+            let size = format_size(file_size);
+            return PreviewData::UnsupportedImageMascot {
+                filename: path_last_segment(path),
+                size,
+            };
+        }
+    }
+
     let mut lines = Vec::new();
     lines.push(Line::from(vec![label("name"), val(path_last_segment(path))]));
     lines.push(Line::from(vec![label("path"), val(path.display().to_string())]));
@@ -2882,6 +3053,50 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{size:.1} {}", UNITS[idx])
     }
+}
+
+fn image_metadata_lines(path: &Path) -> Vec<Line<'static>> {
+    let filename = path_last_segment(path);
+    let meta = fs::metadata(path).ok();
+    let size = meta
+        .as_ref()
+        .map(|m| format_size(m.len()))
+        .unwrap_or_else(|| "-".to_string());
+    let modified = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .map(|m| format_system_time(Some(m)))
+        .unwrap_or_else(|| "-".to_string());
+    let dim_text = image::image_dimensions(path)
+        .map(|(w, h)| format!("{w}x{h} px"))
+        .unwrap_or_else(|_| "-".to_string());
+    vec![
+        Line::from(filename),
+        Line::from(dim_text),
+        Line::from(size),
+        Line::from(modified),
+    ]
+}
+
+fn image_preview_panel_height(area: Rect, path: &Path) -> u16 {
+    // Terminal cells are usually taller than they are wide.
+    // width/height ~= 0.5 keeps visual image proportions in cell-space.
+    const CELL_WIDTH_OVER_HEIGHT: f64 = 0.5;
+    let min_panel_height = 6u16;
+    let max_panel_height = area.height.saturating_sub(5).max(min_panel_height);
+    let Ok((img_w, img_h)) = image::image_dimensions(path) else {
+        return max_panel_height;
+    };
+    if img_w == 0 || img_h == 0 {
+        return max_panel_height;
+    }
+
+    let inner_width = area.width.saturating_sub(2).max(1) as f64;
+    let desired_inner_height =
+        (inner_width * (img_h as f64 / img_w as f64) * CELL_WIDTH_OVER_HEIGHT).ceil() as u16;
+    desired_inner_height
+        .saturating_add(2)
+        .clamp(min_panel_height, max_panel_height)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
