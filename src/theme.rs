@@ -14,6 +14,7 @@ pub struct Theme {
     pub preview: PreviewTheme,
     pub status_bar: StatusBarTheme,
     pub keymap_bar: KeymapBarTheme,
+    pub overlay: OverlayTheme,
     pub git: GitTheme,
     pub selection: SelectionTheme,
 }
@@ -139,6 +140,23 @@ pub struct KeymapBarTheme {
 }
 
 #[derive(Debug, Clone)]
+pub struct OverlayTheme {
+    pub dim_bg: String,
+    pub border: String,
+    pub background: String,
+    pub title_fg: String,
+    pub text_fg: String,
+    pub secondary_fg: String,
+    pub input_bg: String,
+    pub input_fg: String,
+    pub input_cursor: String,
+    pub bool_yes: String,
+    pub bool_no: String,
+    pub bool_yes_bg: String,
+    pub bool_no_bg: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct GitTheme {
     pub modified: String,
     pub untracked: String,
@@ -255,6 +273,21 @@ impl Theme {
                 key: get("keymap_bar.key", "#FFFFFF"),
                 label: get("keymap_bar.label", "#FFFFFF"),
                 separator: get("keymap_bar.separator", "#FFFFFF"),
+            },
+            overlay: OverlayTheme {
+                dim_bg: get("overlay.dim_bg", &get("vars.secondary_bg", "#FFFFFF")),
+                border: get("overlay.border", &get("vars.accent", "#FFFFFF")),
+                background: get("overlay.background", &get("vars.primary_bg", "#FFFFFF")),
+                title_fg: get("overlay.title_fg", &get("vars.accent", "#FFFFFF")),
+                text_fg: get("overlay.text_fg", &get("vars.primary_fg", "#FFFFFF")),
+                secondary_fg: get("overlay.secondary_fg", &get("vars.secondary_fg", "#FFFFFF")),
+                input_bg: get("overlay.input_bg", &get("vars.secondary_bg", "#FFFFFF")),
+                input_fg: get("overlay.input_fg", &get("vars.primary_fg", "#FFFFFF")),
+                input_cursor: get("overlay.input_cursor", &get("vars.active", "#FFFFFF")),
+                bool_yes: get("overlay.bool_yes", "#84E052"),
+                bool_no: get("overlay.bool_no", "#F64646"),
+                bool_yes_bg: get("overlay.bool_yes_bg", &get("vars.primary_bg", "#FFFFFF")),
+                bool_no_bg: get("overlay.bool_no_bg", &get("vars.primary_bg", "#FFFFFF")),
             },
             git: GitTheme {
                 modified: get("git.modified", "#FFFFFF"),

@@ -15,16 +15,17 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use git2::{Repository, StatusOptions};
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
-use ratatui::layout::Alignment;
 use serde::{Deserialize, Serialize};
 use crate::theme::{ColumnTheme, Theme};
 use crate::mascot::render_empty_dir_mascot;
 use crate::ui::preview::{self, ImageProtocol, PreviewImageConfig};
+use crate::ui::overlay::{self, OverlayDialog, OverlayDialogKind, OverlayFrame};
+use crate::ui::searchbar::{parse_command, SearchbarCommand};
 
 pub fn run_app() -> Result<()> {
     color_eyre::install()?;
@@ -332,6 +333,7 @@ struct App {
     global_selected: usize,
     input_mode: InputMode,
     input_buffer: String,
+    rename_target: Option<PathBuf>,
     clipboard: Option<ClipboardItem>,
     status_message: String,
     selection_mode: bool,
@@ -352,6 +354,7 @@ struct App {
     sudo_mode: bool,
     sudo_password_prompt: bool,
     sudo_password_input: String,
+    keybinds_overlay: Option<OverlayFrame>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,11 +364,20 @@ enum SearchMode {
     Global,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct UiModeState {
+    sudo: bool,
+    select: bool,
+    bookmark: bool,
+    search: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     None,
     NewFile,
     NewDir,
+    Rename,
 }
 
 #[derive(Debug, Clone)]
@@ -383,6 +395,7 @@ enum DialogState {
         new_path: String,
         yes_selected: bool,
     },
+    Message { title: String, text: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -469,6 +482,7 @@ impl App {
             global_selected: 0,
             input_mode: InputMode::None,
             input_buffer: String::new(),
+            rename_target: None,
             clipboard: None,
             status_message: String::new(),
             selection_mode: false,
@@ -489,10 +503,15 @@ impl App {
             sudo_mode: false,
             sudo_password_prompt: false,
             sudo_password_input: String::new(),
+            keybinds_overlay: None,
         })
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.keybinds_overlay.is_some() {
+            self.handle_keybinds_overlay_key(key);
+            return;
+        }
         if self.dialog.is_some() {
             self.handle_dialog_key(key);
             return;
@@ -541,8 +560,8 @@ impl App {
         match key.code {
             KeyCode::Char('p') => self.next_profile(),
             KeyCode::Char('P') => self.prev_profile(),
-            KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
-            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+            KeyCode::Up => self.select_prev(),
+            KeyCode::Down => self.select_next(),
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.enter_selected_dir(),
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.go_parent(),
             KeyCode::Char('/') => self.start_local_search(),
@@ -556,6 +575,7 @@ impl App {
                 self.start_new_dir();
             }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.start_new_file(),
+            KeyCode::F(2) => self.start_rename(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.copy_selected(),
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => self.cut_selected(),
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => self.paste_clipboard(),
@@ -638,6 +658,8 @@ impl App {
         }
         if self.dialog.is_some() {
             self.draw_dialog(frame);
+        } else if self.input_mode != InputMode::None || self.sudo_password_prompt || self.keybinds_overlay.is_some() {
+            self.draw_dialog(frame);
         }
     }
 
@@ -672,24 +694,15 @@ impl App {
     }
 
     fn draw_top_bar(&self, frame: &mut Frame, area: Rect) {
-        let sudo_color = parse_color(&self.effective.theme_colors.vars.sudo_mode);
-        let mode_color = if self.sudo_mode {
-            sudo_color
-        } else if self.awaiting_bookmark_slot {
-            parse_color(&self.effective.theme_colors.vars.bookmark_mode)
-        } else if self.search_mode != SearchMode::None {
-            parse_color(&self.effective.theme_colors.vars.search_mode)
-        } else if self.selection_mode {
-            parse_color(&self.effective.theme_colors.vars.selection_mode)
-        } else {
-            parse_color(&self.effective.theme_colors.vars.defult_panel_label)
-        };
-        let top_bar_fg = mode_color;
-        let top_bar_border = if self.sudo_mode || self.awaiting_bookmark_slot || self.search_mode != SearchMode::None || self.selection_mode {
+        let mode_active =
+            self.sudo_mode || self.awaiting_bookmark_slot || self.selection_mode || self.search_mode != SearchMode::None;
+        let mode_color = self.ui_mode_color();
+        let top_bar_fg = if mode_active {
             mode_color
         } else {
-            parse_color(&self.effective.theme_colors.vars.defult_panel_border)
+            parse_color(&self.effective.theme_colors.vars.primary_fg)
         };
+        let top_bar_border = top_bar_fg;
         let constraints = self.main_panel_constraints();
         let segments = Layout::default()
             .direction(Direction::Horizontal)
@@ -698,10 +711,10 @@ impl App {
 
         let mut seg_idx = 0;
         if self.effective.panels.sidebar {
-            let (lhs, rhs) = if self.awaiting_bookmark_slot {
-                ("DIRT::".to_string(), "bookmark".to_string())
-            } else if self.search_mode != SearchMode::None {
+            let (lhs, rhs) = if self.search_mode != SearchMode::None {
                 ("DIRT::".to_string(), "search".to_string())
+            } else if self.awaiting_bookmark_slot {
+                ("DIRT::".to_string(), "bookmark".to_string())
             } else if self.selection_mode {
                 ("DIRT::".to_string(), "selection".to_string())
             } else if self.sudo_mode {
@@ -711,7 +724,7 @@ impl App {
                     .get(self.active_profile)
                     .map(|p| p.name.as_str())
                     .unwrap_or("default");
-                ("DIRT // ".to_string(), format!("{profile_name} // SUDO"))
+                ("DIRT // ".to_string(), profile_name.to_string())
             } else {
                 let profile_name = self
                     .config
@@ -762,6 +775,7 @@ impl App {
                 match self.input_mode {
                     InputMode::NewFile => format!("new file: {}", self.input_buffer),
                     InputMode::NewDir => format!("new dir: {}", self.input_buffer),
+                    InputMode::Rename => format!("rename: {}", self.input_buffer),
                     InputMode::None => search_label,
                 }
             };
@@ -786,8 +800,13 @@ impl App {
         }
 
         if self.effective.panels.preview {
+            let preview_label = if self.sudo_mode {
+                format!("SUDO @ {}", self.device_name)
+            } else {
+                format!("{} @ {}", self.user_name, self.device_name)
+            };
             frame.render_widget(
-                Paragraph::new(format!("{} @ {}", self.user_name, self.device_name))
+                Paragraph::new(preview_label)
                     .style(Style::default().fg(top_bar_fg))
                     .block(
                         Block::default()
@@ -803,14 +822,12 @@ impl App {
     fn draw_sidebar(&self, frame: &mut Frame, area: Rect) {
         let panel_fg = parse_color(&self.effective.theme_colors.vars.defult_panel_label);
         let bookmark_fg = if self.awaiting_bookmark_slot {
-            parse_color(&self.effective.theme_colors.vars.bookmark_mode)
+            self.ui_mode_color()
         } else {
             panel_fg
         };
-        let sidebar_border = if self.sudo_mode {
-            parse_color(&self.effective.theme_colors.vars.sudo_mode)
-        } else if self.awaiting_bookmark_slot {
-            parse_color(&self.effective.theme_colors.vars.bookmark_mode)
+        let sidebar_border = if self.sudo_mode || self.awaiting_bookmark_slot || self.selection_mode || self.search_mode != SearchMode::None {
+            self.ui_mode_color()
         } else {
             parse_color(&self.effective.theme_colors.vars.defult_panel_border)
         };
@@ -850,7 +867,7 @@ impl App {
         for (slot_ch, exists, title) in bookmark_slots.into_iter().take(max_bookmark_rows) {
             let line = if exists {
                 let filled_color = if self.awaiting_bookmark_slot {
-                    parse_color(&self.effective.theme_colors.vars.bookmark_mode)
+                    self.ui_mode_color()
                 } else {
                     parse_color(&self.effective.theme_colors.vars.primary_fg)
                 };
@@ -858,7 +875,7 @@ impl App {
             } else if self.awaiting_bookmark_slot {
                 Line::from(vec![Span::styled(
                     format!("  {slot_ch}"),
-                    Style::default().fg(parse_color(&self.effective.theme_colors.vars.bookmark_mode)),
+                    Style::default().fg(self.ui_mode_color()),
                 )])
             } else {
                 Line::from(vec![Span::styled(
@@ -1070,15 +1087,7 @@ impl App {
             };
             let mode_highlight_active =
                 self.sudo_mode || self.awaiting_bookmark_slot || self.selection_mode || self.search_mode != SearchMode::None;
-            let mode_highlight_color = if self.sudo_mode {
-                &self.effective.theme_colors.vars.sudo_mode
-            } else if self.awaiting_bookmark_slot {
-                &self.effective.theme_colors.vars.bookmark_mode
-            } else if self.search_mode != SearchMode::None {
-                &self.effective.theme_colors.vars.search_mode
-            } else {
-                &self.effective.theme_colors.vars.selection_mode
-            };
+            let mode_highlight_color = self.ui_mode_color_name();
             let viewport_height = chunks[idx].height.saturating_sub(2) as usize;
             let anchor_idx = if is_focused_column {
                 filtered_indices.iter().position(|&x| x == col.selected).unwrap_or(0)
@@ -1478,21 +1487,15 @@ impl App {
     }
 
     fn draw_details_panel(&self, frame: &mut Frame, area: Rect) {
-        let details_color = if self.sudo_mode {
-            parse_color(&self.effective.theme_colors.vars.sudo_mode)
-        } else if self.search_mode != SearchMode::None {
-            parse_color(&self.effective.theme_colors.vars.search_mode)
-        } else if self.selection_mode {
-            parse_color(&self.effective.theme_colors.vars.selection_mode)
+        let mode_active =
+            self.sudo_mode || self.awaiting_bookmark_slot || self.selection_mode || self.search_mode != SearchMode::None;
+        let details_color = if mode_active {
+            self.ui_mode_color()
         } else {
             parse_color(&self.effective.theme_colors.vars.defult_panel_border)
         };
-        let details_title_color = if self.sudo_mode {
-            parse_color(&self.effective.theme_colors.vars.sudo_mode)
-        } else if self.search_mode != SearchMode::None {
-            parse_color(&self.effective.theme_colors.vars.search_mode)
-        } else if self.selection_mode {
-            parse_color(&self.effective.theme_colors.vars.selection_mode)
+        let details_title_color = if mode_active {
+            self.ui_mode_color()
         } else {
             parse_color(&self.effective.theme_colors.vars.defult_panel_label)
         };
@@ -1656,6 +1659,7 @@ impl App {
             .unwrap_or("default");
         let panel_fg = parse_color(&self.effective.theme_colors.vars.defult_panel_label);
         let sudo_color = parse_color(&self.effective.theme_colors.vars.sudo_mode);
+        let mode_color = self.ui_mode_color();
         let sep = Span::styled(" · ", Style::default().fg(panel_fg));
         let mut spans = vec![
             Span::styled(
@@ -1708,8 +1712,8 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(std::mem::take(&mut spans))).block(
                 Block::default().borders(Borders::TOP).border_style(
-                    Style::default().fg(if self.sudo_mode {
-                        sudo_color
+                    Style::default().fg(if self.sudo_mode || self.awaiting_bookmark_slot || self.selection_mode || self.search_mode != SearchMode::None {
+                        mode_color
                     } else {
                         parse_color(&self.effective.theme_colors.vars.defult_panel_border)
                     }),
@@ -1755,50 +1759,72 @@ impl App {
     }
 
     fn draw_dialog(&self, frame: &mut Frame) {
+        overlay::draw_dim(frame, &self.effective.theme_colors);
+        if let Some(frame_state) = &self.keybinds_overlay {
+            overlay::draw_frame(frame, &self.effective.theme_colors, frame_state);
+            return;
+        }
+        if self.sudo_password_prompt {
+            overlay::draw_dialog(
+                frame,
+                &self.effective.theme_colors,
+                &OverlayDialog {
+                    title: "SUDO PASSWORD".to_string(),
+                    message: "[sudo] password:".to_string(),
+                    kind: OverlayDialogKind::Input { password: true, placeholder: None },
+                    input: self.sudo_password_input.clone(),
+                    selected_is_primary: true,
+                },
+            );
+            return;
+        }
+        if self.input_mode != InputMode::None {
+            let title = match self.input_mode {
+                InputMode::NewFile => "NEW FILE",
+                InputMode::NewDir => "NEW FOLDER",
+                InputMode::Rename => "RENAME",
+                InputMode::None => "INPUT",
+            };
+            overlay::draw_dialog(
+                frame,
+                &self.effective.theme_colors,
+                &OverlayDialog {
+                    title: title.to_string(),
+                    message: String::new(),
+                    kind: OverlayDialogKind::Input { password: false, placeholder: None },
+                    input: self.input_buffer.clone(),
+                    selected_is_primary: true,
+                },
+            );
+            return;
+        }
         let Some(dialog) = &self.dialog else {
             return;
         };
-
-        frame.render_widget(
-            Block::default().style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::DIM),
-            ),
-            frame.area(),
-        );
-
-        let popup_area = centered_rect(50, 30, frame.area());
-        frame.render_widget(Clear, popup_area);
-
         match dialog {
             DialogState::ConfirmDelete {
                 paths,
                 yes_selected,
             } => {
-                let yes = if *yes_selected { "[ YES ]" } else { "  YES  " };
-                let no = if !*yes_selected { "[ NO ]" } else { "  NO  " };
-                let text = format!(
-                    "Move {} item(s) to trash?\n\n{}    {}\n\nEnter confirm · Esc cancel",
-                    paths.len(),
-                    yes,
-                    no
-                );
-                frame.render_widget(
-                    Paragraph::new(text)
-                        .alignment(Alignment::Center)
-                        .block(
-                            Block::default()
-                                .title("Confirm Delete")
-                                .borders(Borders::ALL)
-                                .style(
-                                    Style::default()
-                                        .bg(parse_color(&self.effective.theme_colors.vars.primary_bg))
-                                        .fg(parse_color(&self.effective.theme_colors.vars.primary_fg)),
-                                ),
-                        ),
-                    popup_area,
+                let msg = if paths.len() == 1 {
+                    let name = paths[0]
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "item".to_string());
+                    format!("Delete {name}?")
+                } else {
+                    format!("Delete {} items?", paths.len())
+                };
+                overlay::draw_dialog(
+                    frame,
+                    &self.effective.theme_colors,
+                    &OverlayDialog {
+                        title: "CONFIRM".to_string(),
+                        message: msg,
+                        kind: OverlayDialogKind::Confirm,
+                        input: String::new(),
+                        selected_is_primary: *yes_selected,
+                    },
                 );
             }
             DialogState::ConfirmBookmarkOverwrite {
@@ -1807,29 +1833,29 @@ impl App {
                 new_path,
                 yes_selected,
             } => {
-                let yes = if *yes_selected { "[ YES ]" } else { "  YES  " };
-                let no = if !*yes_selected { "[ NO ]" } else { "  NO  " };
-                let text = format!(
-                    "Overwrite bookmark {slot}?\n\nold: {}\nnew: {}\n\n{}    {}\n\nEnter confirm · Esc cancel",
-                    existing_path,
-                    new_path,
-                    yes,
-                    no
+                overlay::draw_dialog(
+                    frame,
+                    &self.effective.theme_colors,
+                    &OverlayDialog {
+                        title: "CONFIRM".to_string(),
+                        message: format!("Overwrite bookmark {slot}?\nold: {existing_path}\nnew: {new_path}"),
+                        kind: OverlayDialogKind::Confirm,
+                        input: String::new(),
+                        selected_is_primary: *yes_selected,
+                    },
                 );
-                frame.render_widget(
-                    Paragraph::new(text)
-                        .alignment(Alignment::Center)
-                        .block(
-                            Block::default()
-                                .title("Confirm Bookmark Overwrite")
-                                .borders(Borders::ALL)
-                                .style(
-                                    Style::default()
-                                        .bg(parse_color(&self.effective.theme_colors.vars.primary_bg))
-                                        .fg(parse_color(&self.effective.theme_colors.vars.primary_fg)),
-                                ),
-                        ),
-                    popup_area,
+            }
+            DialogState::Message { title, text } => {
+                overlay::draw_dialog(
+                    frame,
+                    &self.effective.theme_colors,
+                    &OverlayDialog {
+                        title: title.clone(),
+                        message: text.clone(),
+                        kind: OverlayDialogKind::Message,
+                        input: String::new(),
+                        selected_is_primary: true,
+                    },
                 );
             }
         }
@@ -2021,6 +2047,90 @@ fn bookmark_matches_slot(bookmark: &Bookmark, slot: char) -> bool {
 }
 
 impl App {
+    fn ui_mode_state(&self) -> UiModeState {
+        UiModeState {
+            sudo: self.sudo_mode,
+            select: self.selection_mode,
+            bookmark: self.awaiting_bookmark_slot,
+            search: self.search_mode != SearchMode::None,
+        }
+    }
+
+    // Mode precedence: normal -> sudo -> select/bookmark -> search.
+    fn ui_mode_color_name(&self) -> &String {
+        let mode = self.ui_mode_state();
+        if mode.search {
+            &self.effective.theme_colors.vars.search_mode
+        } else if mode.bookmark {
+            &self.effective.theme_colors.vars.bookmark_mode
+        } else if mode.select {
+            &self.effective.theme_colors.vars.selection_mode
+        } else if mode.sudo {
+            &self.effective.theme_colors.vars.sudo_mode
+        } else {
+            &self.effective.theme_colors.vars.defult_panel_label
+        }
+    }
+
+    fn ui_mode_color(&self) -> Color {
+        parse_color(self.ui_mode_color_name())
+    }
+
+    fn build_keybinds_overlay(&self) -> OverlayFrame {
+        let mut lines = Vec::new();
+        lines.push(("NAVIGATION".to_string(), String::new(), true));
+        lines.push((self.keymap.navigation.up.join("/"), "Move up".to_string(), false));
+        lines.push((self.keymap.navigation.down.join("/"), "Move down".to_string(), false));
+        lines.push((self.keymap.navigation.open.join("/"), "Open".to_string(), false));
+        lines.push((self.keymap.navigation.parent.join("/"), "Parent".to_string(), false));
+        lines.push(("".to_string(), "".to_string(), false));
+        lines.push(("SELECTION".to_string(), String::new(), true));
+        lines.push((self.keymap.selection.mode.clone(), "Toggle selection mode".to_string(), false));
+        lines.push((self.keymap.selection.toggle.clone(), "Toggle selected".to_string(), false));
+        lines.push((self.keymap.selection.range_up.join("/"), "Range up".to_string(), false));
+        lines.push((self.keymap.selection.range_down.join("/"), "Range down".to_string(), false));
+        lines.push((self.keymap.selection.exit.clone(), "Exit selection mode".to_string(), false));
+        lines.push(("".to_string(), "".to_string(), false));
+        lines.push(("SEARCH".to_string(), String::new(), true));
+        lines.push((self.keymap.search.local.clone(), "Local search".to_string(), false));
+        lines.push((self.keymap.search.global.clone(), "Global search".to_string(), false));
+        lines.push(("".to_string(), "".to_string(), false));
+        lines.push(("MODES".to_string(), String::new(), true));
+        lines.push((self.keymap.selection.mode.clone(), "Toggle select mode".to_string(), false));
+        lines.push(("Ctrl+B".to_string(), "Bookmark set mode".to_string(), false));
+        lines.push(("Ctrl+1..9".to_string(), "Open bookmark slot".to_string(), false));
+        lines.push(("/sudo".to_string(), "Toggle sudo mode".to_string(), false));
+        lines.push((self.keymap.search.local.clone(), "Enter search mode".to_string(), false));
+        lines.push((self.keymap.search.global.clone(), "Enter global search mode".to_string(), false));
+        lines.push(("Esc".to_string(), "Exit active mode".to_string(), false));
+        lines.push(("".to_string(), "".to_string(), false));
+        lines.push(("FILE OPS".to_string(), String::new(), true));
+        lines.push((self.keymap.file_ops.new_file.clone(), "New file".to_string(), false));
+        lines.push((self.keymap.file_ops.new_dir.clone(), "New folder".to_string(), false));
+        lines.push((self.keymap.file_ops.copy.clone(), "Copy".to_string(), false));
+        lines.push((self.keymap.file_ops.cut.clone(), "Cut".to_string(), false));
+        lines.push((self.keymap.file_ops.paste.clone(), "Paste".to_string(), false));
+        lines.push((self.keymap.file_ops.trash.clone(), "Delete to trash".to_string(), false));
+        lines.push(("".to_string(), "".to_string(), false));
+        lines.push(("APP".to_string(), String::new(), true));
+        lines.push((self.keymap.app.quit.clone(), "Quit".to_string(), false));
+        lines.push((self.keymap.app.next_profile.clone(), "Next profile".to_string(), false));
+        lines.push((self.keymap.app.prev_profile.clone(), "Previous profile".to_string(), false));
+        OverlayFrame { title: "KEYBINDS".to_string(), lines, scroll: 0 }
+    }
+
+    fn handle_keybinds_overlay_key(&mut self, key: crossterm::event::KeyEvent) {
+        let Some(overlay) = self.keybinds_overlay.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => self.keybinds_overlay = None,
+            KeyCode::Up | KeyCode::Char('k') => overlay.scroll = overlay.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => overlay.scroll = overlay.scroll.saturating_add(1),
+            _ => {}
+        }
+    }
+
 
     fn start_local_search(&mut self) {
         self.search_mode = SearchMode::Local;
@@ -2049,36 +2159,44 @@ impl App {
                 if self.search_mode == SearchMode::Global {
                     self.open_global_selected();
                 } else {
-                    let cmd = self.search_query.trim();
-                    if cmd == "sudo" || cmd == "/sudo" {
-                        self.toggle_sudo_mode();
-                    } else if cmd == "config init" || cmd == "/config init" {
-                        self.status_message = match init_config_file() {
-                            Ok(msg) => msg,
-                            Err(e) => format!("config init failed: {e}"),
-                        };
-                    } else if cmd == "config layout init" || cmd == "/config layout init" {
-                        self.status_message = match init_layout_file() {
-                            Ok(msg) => msg,
-                            Err(e) => format!("config layout init failed: {e}"),
-                        };
-                    } else if cmd == "config theme init" || cmd == "/config theme init" {
-                        self.status_message = match init_theme_file() {
-                            Ok(msg) => msg,
-                            Err(e) => format!("config theme init failed: {e}"),
-                        };
-                    } else if cmd == "keymap init" || cmd == "/keymap init" {
-                        self.status_message = match init_keymap_file() {
-                            Ok(msg) => msg,
-                            Err(e) => format!("keymap init failed: {e}"),
-                        };
+                    if let Some(cmd) = parse_command(self.search_query.trim()) {
+                        match cmd {
+                            SearchbarCommand::ToggleSudo => self.toggle_sudo_mode(),
+                            SearchbarCommand::ConfigInit => {
+                                self.status_message = match init_config_file() {
+                                    Ok(msg) => msg,
+                                    Err(e) => format!("config init failed: {e}"),
+                                };
+                            }
+                            SearchbarCommand::ConfigLayoutInit => {
+                                self.status_message = match init_layout_file() {
+                                    Ok(msg) => msg,
+                                    Err(e) => format!("config layout init failed: {e}"),
+                                };
+                            }
+                            SearchbarCommand::ConfigThemeInit => {
+                                self.status_message = match init_theme_file() {
+                                    Ok(msg) => msg,
+                                    Err(e) => format!("config theme init failed: {e}"),
+                                };
+                            }
+                            SearchbarCommand::KeymapInit => {
+                                self.status_message = match init_keymap_file() {
+                                    Ok(msg) => msg,
+                                    Err(e) => format!("keymap init failed: {e}"),
+                                };
+                            }
+                            SearchbarCommand::Keybinds => {
+                                self.keybinds_overlay = Some(self.build_keybinds_overlay());
+                            }
+                        }
                     }
                     self.search_mode = SearchMode::None;
                     self.search_query.clear();
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
-            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+            KeyCode::Up => self.select_prev(),
+            KeyCode::Down => self.select_next(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.search_query.push(c);
                 self.on_search_query_changed();
@@ -2090,7 +2208,10 @@ impl App {
     fn on_search_query_changed(&mut self) {
         match self.search_mode {
             SearchMode::Local => {
-                if self.search_query.trim() == "/sudo" || self.search_query.trim() == "sudo" {
+                if matches!(
+                    self.search_query.trim(),
+                    "/sudo" | "sudo" | "/keybinds" | "keybinds"
+                ) {
                     return;
                 }
                 let filtered = self
@@ -2201,6 +2322,7 @@ impl App {
             KeyCode::Esc => {
                 self.input_mode = InputMode::None;
                 self.input_buffer.clear();
+                self.rename_target = None;
             }
             KeyCode::Backspace => {
                 self.input_buffer.pop();
@@ -2218,11 +2340,26 @@ impl App {
     fn start_new_file(&mut self) {
         self.input_mode = InputMode::NewFile;
         self.input_buffer.clear();
+        self.rename_target = None;
     }
 
     fn start_new_dir(&mut self) {
         self.input_mode = InputMode::NewDir;
         self.input_buffer.clear();
+        self.rename_target = None;
+    }
+
+    fn start_rename(&mut self) {
+        let Some(path) = self.selected_entry_path() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.input_mode = InputMode::Rename;
+        self.input_buffer = name;
+        self.rename_target = Some(path);
     }
 
     fn commit_input_mode(&mut self) {
@@ -2237,14 +2374,34 @@ impl App {
         let result = match self.input_mode {
             InputMode::NewFile => fs::write(&target, ""),
             InputMode::NewDir => fs::create_dir_all(&target),
+            InputMode::Rename => {
+                if let Some(source) = self.rename_target.clone() {
+                    let dest = source
+                        .parent()
+                        .map(|p| p.join(name))
+                        .unwrap_or_else(|| self.current_dir.join(name));
+                    fs::rename(source, dest)
+                } else {
+                    Err(io::Error::other("missing rename source"))
+                }
+            }
             InputMode::None => Ok(()),
         };
         self.status_message = match result {
             Ok(_) => format!("created {}", target.display()),
-            Err(e) => format!("create failed: {e}"),
+            Err(e) => {
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    self.dialog = Some(DialogState::Message {
+                        title: "PERMISSION ERROR".to_string(),
+                        text: format!("Permission denied:\n{}", target.display()),
+                    });
+                }
+                format!("create failed: {e}")
+            }
         };
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.rename_target = None;
         self.refresh_active_column();
     }
 
@@ -2354,7 +2511,7 @@ impl App {
         match dialog {
             DialogState::ConfirmDelete { yes_selected, .. } => match key.code {
                 KeyCode::Left | KeyCode::Char('h') => *yes_selected = true,
-                KeyCode::Right | KeyCode::Char('l') => *yes_selected = false,
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => *yes_selected = false,
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     *yes_selected = true;
                     self.confirm_dialog();
@@ -2368,7 +2525,7 @@ impl App {
             },
             DialogState::ConfirmBookmarkOverwrite { yes_selected, .. } => match key.code {
                 KeyCode::Left | KeyCode::Char('h') => *yes_selected = true,
-                KeyCode::Right | KeyCode::Char('l') => *yes_selected = false,
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => *yes_selected = false,
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     *yes_selected = true;
                     self.confirm_dialog();
@@ -2378,6 +2535,12 @@ impl App {
                     self.status_message = "bookmark overwrite canceled".to_string();
                 }
                 KeyCode::Enter => self.confirm_dialog(),
+                _ => {}
+            },
+            DialogState::Message { .. } => match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.dialog = None;
+                }
                 _ => {}
             },
         }
@@ -2436,6 +2599,7 @@ impl App {
                     self.status_message = format!("bookmark {slot} not found");
                 }
             }
+            DialogState::Message { .. } => {}
         }
     }
 
@@ -2595,6 +2759,8 @@ impl App {
         match key.code {
             KeyCode::Esc => self.exit_selection_mode(),
             KeyCode::Char(' ') if key.modifiers.is_empty() => self.toggle_focused_selection(),
+            KeyCode::Char('/') if key.modifiers.is_empty() => self.start_local_search(),
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => self.start_global_search(),
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.select_prev_range_mode(),
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.select_next_range_mode(),
             KeyCode::Up | KeyCode::Char('k') => self.select_prev_mode(),
@@ -2620,6 +2786,7 @@ impl App {
                 self.start_new_dir()
             }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.start_new_file(),
+            KeyCode::F(2) => self.start_rename(),
             _ => {}
         }
     }
@@ -3594,6 +3761,10 @@ fn ensure_local_defaults_files() -> io::Result<()> {
     if !theme.exists() {
         fs::write(&theme, default_theme_contents())?;
     }
+    let keymap = dir.join("keymap.toml");
+    if !keymap.exists() {
+        fs::write(&keymap, default_keymap_contents())?;
+    }
     Ok(())
 }
 
@@ -3696,36 +3867,7 @@ fn default_config_contents() -> &'static str {
 }
 
 fn default_keymap_contents() -> &'static str {
-    r#"[navigation]
-up     = ["Up", "k"]
-down   = ["Down", "j"]
-open   = ["Right", "l", "Enter"]
-parent = ["Left", "h", "Backspace"]
-
-[selection]
-range_up   = ["Shift+Up"]
-range_down = ["Shift+Down"]
-mode   = "Ctrl+S"
-toggle = "Space"
-exit   = "Esc"
-
-[search]
-local  = "/"
-global = "Ctrl+F"
-
-[file_ops]
-new_file = "Ctrl+N"
-new_dir  = "Ctrl+Shift+N"
-copy     = "Ctrl+C"
-cut      = "Ctrl+X"
-paste    = "Ctrl+V"
-trash    = "Ctrl+D"
-
-[app]
-quit         = "q"
-next_profile = "p"
-prev_profile = "P"
-"#
+    include_str!("../defaults/keymap.toml")
 }
 
 fn default_theme_contents() -> &'static str {
