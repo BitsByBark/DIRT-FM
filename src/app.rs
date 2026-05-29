@@ -993,7 +993,9 @@ impl App {
                             .iter()
                             .map(|e| {
                                 let kind = if e.is_dir { "/" } else { "" };
-                                ListItem::new(format!(" {}{}", e.name, kind))
+                                ListItem::new(format!(" {}{}", e.name, kind)).style(
+                                    Style::default().fg(parse_color(&self.effective.theme_colors.vars.defult_text)),
+                                )
                             })
                             .collect::<Vec<_>>();
                         let list = List::new(rows).block(
@@ -1093,22 +1095,25 @@ impl App {
                 let absolute_idx = filtered_indices[filtered_row_idx];
                 let entry = &col.entries[absolute_idx];
                 let kind = if entry.is_dir { "/" } else { "" };
+                let entry_fg = if idx == 0 || idx == 1 || idx == 3 {
+                    parse_color(&self.effective.theme_colors.vars.defult_text)
+                } else if entry.is_dir {
+                    parse_color(&col_theme.dir)
+                } else if entry.is_symlink {
+                    parse_color(&col_theme.symlink)
+                } else if entry.is_executable {
+                    parse_color(&col_theme.executable)
+                } else {
+                    parse_color(&col_theme.file)
+                };
                 let base_fg = if is_focused_column {
                     if mode_highlight_active {
                         parse_color(mode_highlight_color)
                     } else {
-                        if entry.is_dir {
-                            parse_color(&col_theme.dir)
-                        } else if entry.is_symlink {
-                            parse_color(&col_theme.symlink)
-                        } else if entry.is_executable {
-                            parse_color(&col_theme.executable)
-                        } else {
-                            parse_color(&col_theme.file)
-                        }
+                        entry_fg
                     }
                 } else {
-                    parse_color(&self.effective.theme_colors.vars.defult_text)
+                    entry_fg
                 };
                 let mut item = ListItem::new(format!(" {}{}", entry.name, kind))
                     .style(Style::default().fg(base_fg));
@@ -1126,12 +1131,12 @@ impl App {
                     } else if is_focused_column && absolute_idx == col.selected {
                         (
                             &self.effective.theme_colors.vars.focused_dir_bg,
-                            &self.effective.theme_colors.vars.focused_dir_text,
+                            &col_theme.focused_fg,
                         )
                     } else {
                         (
                             &self.effective.theme_colors.vars.active_dir_bg,
-                            &self.effective.theme_colors.vars.defult_text,
+                            &col_theme.focused_fg,
                         )
                     };
                     item = item.style(
