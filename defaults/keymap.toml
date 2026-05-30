@@ -1,0 +1,29 @@
+[navigation]
+up     = ["Up", "k"]
+down   = ["Down", "j"]
+open   = ["Right", "l", "Enter"]
+parent = ["Left", "h", "Backspace"]
+
+[selection]
+range_up   = ["Shift+Up"]
+range_down = ["Shift+Down"]
+mode   = "Ctrl+S"
+toggle = "Space"
+exit   = "Esc"
+
+[search]
+local  = "/"
+global = "Ctrl+F"
+
+[file_ops]
+new_file = "Ctrl+N"
+new_dir  = "Ctrl+Shift+N"
+copy     = "Ctrl+C"
+cut      = "Ctrl+X"
+paste    = "Ctrl+V"
+trash    = "Ctrl+D"
+
+[app]
+quit         = "q"
+next_profile = "p"
+prev_profile = "P"

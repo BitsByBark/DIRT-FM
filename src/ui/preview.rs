@@ -33,6 +33,8 @@ pub struct PreviewImageConfig {
     pub max_image_size_mb: u64,
 }
 
+pub use thumbs::stats_snapshot as thumb_stats_snapshot;
+
 const DEFAULT_THUMBNAIL_SIZE: u32 = 256;
 const DEFAULT_CACHE_LIFETIME_HRS: u64 = 24;
 const MAX_PREVIEW_ROWS: u32 = 20;
